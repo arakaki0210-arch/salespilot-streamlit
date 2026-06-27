@@ -20,6 +20,7 @@ DB_PATH = DATA_DIR / "app_db.json"
 NAV_KEY = "active_page"
 NAV_REQUEST_KEY = "requested_page"
 FOCUS_ACTION_KEY = "focus_action"
+DETAIL_VIEW_KEY = "detail_view"
 
 
 def get_secret(name: str, default: Any = None) -> Any:
@@ -465,21 +466,33 @@ def due_bucket(deal: dict[str, Any]) -> str:
     return "今後の予定"
 
 
+def open_detail_view(view_name: str) -> None:
+    st.session_state[DETAIL_VIEW_KEY] = view_name
+    st.session_state[FOCUS_ACTION_KEY] = view_name
+    st.session_state[NAV_REQUEST_KEY] = "案件詳細"
+    st.rerun()
+
+
 def render_onboarding_guide(has_deals: bool) -> None:
     st.subheader("まずやること")
     steps = [
-        ("1", "案件を登録", "顧客名・商材・概要を入れて案件を作ります。"),
-        ("2", "商談前リサーチ", "顧客に刺さる機能・運用・訴求を整理します。"),
-        ("3", "商談メモ分析", "商談後に次回アクションと提案材料を抽出します。"),
+        ("1", "案件を登録", "顧客名・商材・概要を入れて案件を作ります。", "新規案件登録"),
+        ("2", "商談前リサーチ", "顧客に刺さる機能・運用・訴求を整理します。", "商談前リサーチ"),
+        ("3", "商談メモ分析", "商談後に次回アクションと提案材料を抽出します。", "商談メモ分析"),
     ]
     cols = st.columns(3)
-    for col, (num, title, body) in zip(cols, steps):
+    for col, (num, title, body, target) in zip(cols, steps):
         with col:
-            st.container(border=True).markdown(f"### {num}. {title}\n{body}")
-    if not has_deals:
-        if st.button("最初の案件を登録する", type="primary", key="start-first-deal"):
-            st.session_state[NAV_REQUEST_KEY] = "新規案件登録"
-            st.rerun()
+            with st.container(border=True):
+                st.markdown(f"### {num}. {title}\n{body}")
+                disabled = target != "新規案件登録" and not has_deals
+                if st.button(title, type="primary" if num == "1" else "secondary", disabled=disabled, key=f"onboarding-{target}"):
+                    if target == "新規案件登録":
+                        st.session_state[NAV_REQUEST_KEY] = "新規案件登録"
+                        st.rerun()
+                    open_detail_view(target)
+                if disabled:
+                    st.caption("先に案件を登録してください。")
 
 
 def deal_context(deal: dict[str, Any], db: dict[str, Any] | None = None) -> str:
@@ -895,6 +908,7 @@ def render_dashboard(db: dict[str, Any]) -> None:
                     if st.button("開く", key=f"open-{deal['id']}"):
                         st.session_state["selected_deal_id"] = deal["id"]
                         st.session_state[FOCUS_ACTION_KEY] = next_actions[0] if next_actions else ""
+                        st.session_state[DETAIL_VIEW_KEY] = ACTION_TO_TAB.get(next_actions[0], "概要") if next_actions else "概要"
                         st.session_state[NAV_REQUEST_KEY] = "案件詳細"
                         st.rerun()
 
@@ -1298,38 +1312,43 @@ def render_detail(db: dict[str, Any]) -> None:
     if next_actions:
         focus_action = st.session_state.pop(FOCUS_ACTION_KEY, next_actions[0])
         st.info(
-            f"次におすすめ: {focus_action}。下の「{ACTION_TO_TAB.get(focus_action, focus_action)}」タブを開いて作業してください。"
+            f"次におすすめ: {focus_action}。必要な作業画面を開いています。"
         )
-    tabs = st.tabs(
-        [
-            "概要",
-            "商談前リサーチ",
-            "ヒアリング設計",
-            "商談メモ分析",
-            "メール生成",
-            "提案資料骨子",
-            "タイムライン",
-            "受注・失注分析",
-            "生成履歴",
-        ]
+    detail_views = [
+        "概要",
+        "商談前リサーチ",
+        "ヒアリング設計",
+        "商談メモ分析",
+        "メール生成",
+        "提案資料骨子",
+        "タイムライン",
+        "受注・失注分析",
+        "生成履歴",
+    ]
+    requested_view = st.session_state.pop(DETAIL_VIEW_KEY, "概要")
+    selected_view = st.radio(
+        "作業メニュー",
+        detail_views,
+        index=detail_views.index(requested_view) if requested_view in detail_views else 0,
+        horizontal=True,
     )
-    with tabs[0]:
+    if selected_view == "概要":
         render_overview_tab(db, deal)
-    with tabs[1]:
+    elif selected_view == "商談前リサーチ":
         render_research_tab(db, deal)
-    with tabs[2]:
+    elif selected_view == "ヒアリング設計":
         render_hearing_tab(db, deal)
-    with tabs[3]:
+    elif selected_view == "商談メモ分析":
         render_meeting_tab(db, deal)
-    with tabs[4]:
+    elif selected_view == "メール生成":
         render_email_tab(db, deal)
-    with tabs[5]:
+    elif selected_view == "提案資料骨子":
         render_proposal_tab(db, deal)
-    with tabs[6]:
+    elif selected_view == "タイムライン":
         render_timeline_tab(db, deal)
-    with tabs[7]:
+    elif selected_view == "受注・失注分析":
         render_winloss_tab(db, deal)
-    with tabs[8]:
+    else:
         for output in outputs_for_deal(db, deal["id"]):
             with st.expander(f"{AI_LABELS.get(output['type'], output['type'])} / {output['created_at']}"):
                 render_output(output, db, deal, tools_in_expander=False, key_prefix="history")
