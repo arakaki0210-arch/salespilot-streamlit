@@ -466,6 +466,113 @@ def due_bucket(deal: dict[str, Any]) -> str:
     return "今後の予定"
 
 
+def current_timeline_phase(deal: dict[str, Any]) -> str:
+    phase_alias = {"受注": "受注/失注", "失注": "受注/失注", "ペンディング": "フォロー"}
+    current_phase = phase_alias.get(deal.get("phase"), deal.get("phase"))
+    return current_phase if current_phase in TIMELINE_PHASES else "コンタクト前"
+
+
+def timeline_phase_index(phase: str) -> int:
+    return TIMELINE_PHASES.index(phase) if phase in TIMELINE_PHASES else 0
+
+
+def extract_schedule_dates(text: str, reference: date | None = None) -> list[date]:
+    if not text:
+        return []
+    reference = reference or date.today()
+    candidates: list[date] = []
+    patterns = [
+        r"(?P<year>20\d{2})[-/年.](?P<month>\d{1,2})[-/月.](?P<day>\d{1,2})日?",
+        r"(?P<month>\d{1,2})月(?P<day>\d{1,2})日",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            year = int(match.groupdict().get("year") or reference.year)
+            month = int(match.group("month"))
+            day = int(match.group("day"))
+            try:
+                candidate = date(year, month, day)
+            except ValueError:
+                continue
+            if "year" not in match.groupdict() and candidate < reference - timedelta(days=30):
+                try:
+                    candidate = date(reference.year + 1, month, day)
+                except ValueError:
+                    continue
+            candidates.append(candidate)
+    return sorted(set(candidates))
+
+
+def source_text_for_schedule(db: dict[str, Any], deal: dict[str, Any]) -> str:
+    latest_analysis = latest_output(db, deal["id"], "meeting_analysis")
+    parts = [
+        latest_analysis["output_text"] if latest_analysis else "",
+        deal.get("memo") or "",
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def build_auto_schedule_patch(db: dict[str, Any], deal: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    today = date.today()
+    dates = dict(deal.get("timeline_dates") or {})
+    parsed_dates = [item for item in extract_schedule_dates(source_text_for_schedule(db, deal), today) if item >= today - timedelta(days=7)]
+    current_phase = current_timeline_phase(deal)
+    current_index = timeline_phase_index(current_phase)
+    base_date = parse_date(deal.get("next_meeting_date")) or (parsed_dates[0] if parsed_dates else today + timedelta(days=3))
+    target_date = parse_date(deal.get("target_close_date"))
+    if not target_date:
+        target_date = next((item for item in reversed(parsed_dates) if item >= base_date), None)
+    if not target_date or target_date <= base_date:
+        target_date = base_date + timedelta(days=35)
+
+    schedule_dates: dict[str, date] = {}
+    for index, phase in enumerate(TIMELINE_PHASES):
+        if index < current_index:
+            continue
+        if phase == "受注/失注":
+            schedule_dates[phase] = target_date
+        elif phase == current_phase:
+            schedule_dates[phase] = base_date
+        elif phase == "フォロー":
+            schedule_dates[phase] = target_date + timedelta(days=7)
+        else:
+            schedule_dates[phase] = base_date + timedelta(days=max(7, (index - current_index) * 7))
+
+    changes: list[str] = []
+    for phase, value in schedule_dates.items():
+        if not dates.get(phase):
+            dates[phase] = value.isoformat()
+            changes.append(f"{phase}: {dates[phase]}")
+
+    patch: dict[str, Any] = {"timeline_dates": dates}
+    if not deal.get("next_meeting_date"):
+        patch["next_meeting_date"] = base_date.isoformat()
+        changes.append(f"次回予定日: {patch['next_meeting_date']}")
+    if not deal.get("target_close_date"):
+        patch["target_close_date"] = target_date.isoformat()
+        changes.append(f"導入予定日（受注目標日）: {patch['target_close_date']}")
+    return patch, changes
+
+
+def auto_schedule_deal(db: dict[str, Any], deal: dict[str, Any]) -> list[str]:
+    patch, changes = build_auto_schedule_patch(db, deal)
+    if not changes:
+        return []
+    update_deal(db, deal["id"], patch)
+    save_db(db)
+    return changes
+
+
+def render_schedule_auto_button(db: dict[str, Any], deal: dict[str, Any], key_prefix: str, label: str = "スケジュール自動作成") -> None:
+    if st.button(label, key=f"{key_prefix}-auto-schedule-{deal['id']}"):
+        changes = auto_schedule_deal(db, deal)
+        if changes:
+            st.success("スケジュールを自動作成しました: " + " / ".join(changes[:4]))
+        else:
+            st.info("未設定の期限はありません。")
+        st.rerun()
+
+
 def open_detail_view(view_name: str) -> None:
     st.session_state[DETAIL_VIEW_KEY] = view_name
     st.session_state[FOCUS_ACTION_KEY] = view_name
@@ -542,9 +649,8 @@ def recommended_next_actions(db: dict[str, Any], deal: dict[str, Any]) -> list[s
 
 
 def timeline_status(deal: dict[str, Any]) -> list[dict[str, str]]:
-    phase_alias = {"受注": "受注/失注", "失注": "受注/失注", "ペンディング": "フォロー"}
-    current_phase = phase_alias.get(deal.get("phase"), deal.get("phase"))
-    current_index = TIMELINE_PHASES.index(current_phase) if current_phase in TIMELINE_PHASES else 0
+    current_phase = current_timeline_phase(deal)
+    current_index = timeline_phase_index(current_phase)
     dates = deal.get("timeline_dates") or {}
     rows = []
     for index, phase in enumerate(TIMELINE_PHASES):
@@ -556,6 +662,89 @@ def timeline_status(deal: dict[str, Any]) -> list[dict[str, str]]:
             status = "未着手"
         rows.append({"フェーズ": phase, "状態": status, "日付": dates.get(phase, "")})
     return rows
+
+
+def timeline_items_for_deal(deal: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for phase, value in (deal.get("timeline_dates") or {}).items():
+        parsed = parse_date(value)
+        if parsed:
+            items.append({"date": parsed, "label": phase, "type": "task"})
+    next_meeting = parse_date(deal.get("next_meeting_date"))
+    if next_meeting:
+        items.append({"date": next_meeting, "label": "次回予定", "type": "next"})
+    target_close = parse_date(deal.get("target_close_date"))
+    if target_close:
+        items.append({"date": target_close, "label": "受注目標", "type": "target"})
+    return sorted(items, key=lambda item: (item["date"], item["type"]))
+
+
+def render_timeline_visualization(deals: list[dict[str, Any]]) -> None:
+    deal_items = [(deal, timeline_items_for_deal(deal)) for deal in deals]
+    dated_items = [item for _deal, items in deal_items for item in items]
+    if not dated_items:
+        st.info("日付が入ると、ここに案件別のタイムスケジュールが表示されます。")
+        return
+
+    today = date.today()
+    min_date = min([today] + [item["date"] for item in dated_items])
+    max_date = max([today + timedelta(days=42)] + [item["date"] for item in dated_items])
+    start = min_date - timedelta(days=min_date.weekday())
+    weeks = []
+    cursor = start
+    while cursor <= max_date:
+        weeks.append((cursor, cursor + timedelta(days=6)))
+        cursor += timedelta(days=7)
+
+    type_class = {"task": "task", "next": "next", "target": "target"}
+    rows_html = []
+    for deal, items in deal_items:
+        cells = []
+        for week_start, week_end in weeks:
+            in_week = [item for item in items if week_start <= item["date"] <= week_end]
+            pills = []
+            for item in in_week:
+                marker = "★" if item["type"] == "target" else "●"
+                label = html.escape(f"{marker} {item['label']} {item['date'].strftime('%m/%d')}")
+                pills.append(f"<span class='pill {type_class.get(item['type'], 'task')}'>{label}</span>")
+            today_class = " today" if week_start <= today <= week_end else ""
+            cells.append(f"<td class='week{today_class}'>{''.join(pills)}</td>")
+        rows_html.append(
+            "<tr>"
+            f"<th class='deal'>{html.escape(deal.get('title') or deal.get('customer_name') or '未設定')}</th>"
+            + "".join(cells)
+            + "</tr>"
+        )
+
+    header_html = "".join(
+        f"<th class='week-head'>{week_start.strftime('%m/%d')}週</th>"
+        for week_start, _week_end in weeks
+    )
+    st.markdown(
+        f"""
+<style>
+.timeline-scroll {{ overflow-x: auto; border: 1px solid #e2e8f0; border-radius: 8px; }}
+.timeline-table {{ border-collapse: collapse; min-width: {max(760, 132 * len(weeks))}px; width: 100%; font-size: .88rem; }}
+.timeline-table th, .timeline-table td {{ border-bottom: 1px solid #e2e8f0; border-right: 1px solid #eef2f7; padding: 8px; vertical-align: top; }}
+.timeline-table thead th {{ background: #f8fafc; color: #334155; font-weight: 700; }}
+.timeline-table .deal {{ position: sticky; left: 0; z-index: 1; min-width: 220px; max-width: 260px; background: #ffffff; text-align: left; }}
+.timeline-table .week-head {{ min-width: 120px; text-align: left; }}
+.timeline-table .week {{ min-height: 54px; background: #ffffff; }}
+.timeline-table .week.today {{ background: #fff7ed; }}
+.timeline-table .pill {{ display: block; margin: 3px 0; padding: 4px 6px; border-radius: 6px; line-height: 1.25; white-space: normal; }}
+.timeline-table .pill.task {{ background: #e0f2fe; color: #075985; }}
+.timeline-table .pill.next {{ background: #dcfce7; color: #166534; }}
+.timeline-table .pill.target {{ background: #fee2e2; color: #991b1b; font-weight: 700; }}
+</style>
+<div class="timeline-scroll">
+  <table class="timeline-table">
+    <thead><tr><th class="deal">案件</th>{header_html}</tr></thead>
+    <tbody>{"".join(rows_html)}</tbody>
+  </table>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def extract_url_text(url: str) -> str:
@@ -889,6 +1078,25 @@ def render_dashboard(db: dict[str, Any]) -> None:
 
     st.subheader("案件別タイムスケジュール")
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    render_timeline_visualization(deals)
+
+    with st.expander("タイムスケジュールから自動作成"):
+        st.caption("期限が未設定の案件だけ補完します。議事メモ分析に日付があれば優先し、読み取れない場合は今日を基準に自動設定します。")
+        for deal in deals:
+            with st.container(border=True):
+                left, middle, right = st.columns([3, 1, 1])
+                with left:
+                    st.markdown(f"**{deal['title']}**")
+                    st.caption(f"次回予定: {format_date(deal.get('next_meeting_date'))} / 受注目標: {format_date(deal.get('target_close_date'))}")
+                with middle:
+                    render_schedule_auto_button(db, deal, key_prefix="dashboard", label="自動作成")
+                with right:
+                    if st.button("開く", key=f"dashboard-open-timeline-{deal['id']}"):
+                        st.session_state["selected_deal_id"] = deal["id"]
+                        st.session_state[DETAIL_VIEW_KEY] = "タイムライン"
+                        st.session_state[FOCUS_ACTION_KEY] = "スケジュール自動作成"
+                        st.session_state[NAV_REQUEST_KEY] = "案件詳細"
+                        st.rerun()
 
     st.subheader("優先度別ネクストアクション")
     for bucket in ["期限切れ", "今日やること", "準備待ち", "今後の予定"]:
@@ -1259,19 +1467,10 @@ def render_proposal_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
 
 def render_timeline_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
     st.subheader("タイムライン")
-    st.caption("各フェーズに日付を入力できます。商談メモ分析後は、次回予定日や受注目標日を自動反映できます。")
+    st.caption("各フェーズに日付を入力できます。未設定の期限はスケジュール自動作成で補完できます。")
     dates = dict(deal.get("timeline_dates") or {})
 
-    if st.button("商談メモから期日を自動反映", key=f"timeline-auto-{deal['id']}"):
-        current_phase = deal.get("phase") if deal.get("phase") in TIMELINE_PHASES else "2回目以降面談前/運用提案前"
-        if deal.get("next_meeting_date"):
-            dates[current_phase] = deal["next_meeting_date"]
-        if deal.get("target_close_date"):
-            dates["受注/失注"] = deal["target_close_date"]
-        update_deal(db, deal["id"], {"timeline_dates": dates})
-        save_db(db)
-        st.success("日付を反映しました。")
-        st.rerun()
+    render_schedule_auto_button(db, deal, key_prefix="timeline-tab")
 
     with st.form(f"timeline-{deal['id']}"):
         for phase in TIMELINE_PHASES:
@@ -1308,6 +1507,9 @@ def render_detail(db: dict[str, Any]) -> None:
     if not deal:
         return
     st.caption(f"{deal['customer_name']} / {deal['product_name']} / フェーズ: {deal['phase']}")
+    top_left, top_right = st.columns([3, 1])
+    with top_right:
+        render_schedule_auto_button(db, deal, key_prefix="detail-top")
     next_actions = recommended_next_actions(db, deal)
     if next_actions:
         focus_action = st.session_state.pop(FOCUS_ACTION_KEY, next_actions[0])
