@@ -17,6 +17,8 @@ import streamlit as st
 APP_NAME = "SalesPilot AI"
 DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "app_db.json"
+NAV_KEY = "active_page"
+NAV_REQUEST_KEY = "requested_page"
 
 
 def get_secret(name: str, default: Any = None) -> Any:
@@ -30,6 +32,7 @@ MONTHLY_DEAL_LIMIT = int(get_secret("MONTHLY_DEAL_LIMIT", 30))
 MONTHLY_AI_LIMIT = int(get_secret("MONTHLY_AI_LIMIT", 300))
 HIGH_MODEL = get_secret("OPENAI_MODEL_HIGH", "gpt-5.4")
 LIGHT_MODEL = get_secret("OPENAI_MODEL_LIGHT", "gpt-5.4-mini")
+MAX_PROMPT_CHARS = int(get_secret("MAX_PROMPT_CHARS", 24_000))
 
 PHASES = [
     "コンタクト前",
@@ -140,6 +143,16 @@ AI_LABELS = {
     "email": "メール生成",
     "proposal_outline": "提案資料骨子",
     "win_loss_analysis": "受注・失注分析",
+}
+
+OUTPUT_TOKEN_LIMITS = {
+    "product_summary": 320,
+    "research": 2200,
+    "hearing": 2400,
+    "meeting_analysis": 2200,
+    "email": 1200,
+    "proposal_outline": 3800,
+    "win_loss_analysis": 1800,
 }
 
 SYSTEM_INSTRUCTIONS = """
@@ -290,7 +303,19 @@ def add_ai_output(
     )
 
 
-def run_openai(prompt: str, quality: str = "high") -> tuple[str, str]:
+def trim_prompt(prompt: str) -> str:
+    if len(prompt) <= MAX_PROMPT_CHARS:
+        return prompt
+    head = prompt[:4000]
+    tail = prompt[-(MAX_PROMPT_CHARS - 4300):]
+    return (
+        f"{head}\n\n"
+        "[注: 入力が長いため、中央部分を省略しています。重要な判断は残っている情報をもとに行ってください。]\n\n"
+        f"{tail}"
+    )
+
+
+def run_openai(prompt: str, quality: str = "high", max_output_tokens: int | None = None) -> tuple[str, str]:
     api_key = get_secret("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEYが未設定です。StreamlitのSecretsにAPIキーを登録してください。")
@@ -302,7 +327,8 @@ def run_openai(prompt: str, quality: str = "high") -> tuple[str, str]:
     response = client.responses.create(
         model=model,
         instructions=SYSTEM_INSTRUCTIONS,
-        input=prompt,
+        input=trim_prompt(prompt),
+        max_output_tokens=max_output_tokens or (2400 if quality == "high" else 900),
     )
     text = getattr(response, "output_text", None)
     if not text:
@@ -323,7 +349,7 @@ def run_ai_and_store(
             f"今月のAI利用上限を超えます。現在 {get_usage(db)['ai_credits']} / {MONTHLY_AI_LIMIT} クレジット利用済みです。"
         )
 
-    output_text, model = run_openai(prompt, quality=quality)
+    output_text, model = run_openai(prompt, quality=quality, max_output_tokens=OUTPUT_TOKEN_LIMITS.get(output_type))
     register_ai_usage(db, credits)
     add_ai_output(db, deal["id"], output_type, prompt, output_text, model, credits)
     save_db(db)
@@ -652,6 +678,7 @@ def render_output(output: dict[str, Any] | None) -> None:
         output["output_text"],
         file_name=f"{output['type']}_{output['created_at'].replace(':', '-')}.md",
         mime="text/markdown",
+        key=f"download-{output['id']}",
     )
 
 
@@ -692,7 +719,7 @@ def render_dashboard(db: dict[str, Any]) -> None:
             st.write("次にやること: " + " → ".join(recommended_next_actions(db, deal)))
             if st.button("この案件を開く", key=f"open-{deal['id']}"):
                 st.session_state["selected_deal_id"] = deal["id"]
-                st.session_state["page"] = "案件詳細"
+                st.session_state[NAV_REQUEST_KEY] = "案件詳細"
                 st.rerun()
 
 
@@ -705,6 +732,8 @@ def render_new_deal(db: dict[str, Any]) -> None:
         return
 
     if "new_product_description" not in st.session_state:
+        st.session_state["new_product_description"] = ""
+    if st.session_state.pop("reset_new_deal_form", False):
         st.session_state["new_product_description"] = ""
 
     col1, col2 = st.columns(2)
@@ -729,7 +758,11 @@ def render_new_deal(db: dict[str, Any]) -> None:
                     return
                 page_text = extract_url_text(product_url)
                 prompt = build_product_summary_prompt(product_name, product_url, page_text)
-                summary, _model = run_openai(prompt, quality="light")
+                summary, _model = run_openai(
+                    prompt,
+                    quality="light",
+                    max_output_tokens=OUTPUT_TOKEN_LIMITS["product_summary"],
+                )
                 register_ai_usage(db, AI_CREDIT_COSTS["product_summary"])
                 save_db(db)
                 st.session_state["new_product_description"] = summary.strip()
@@ -777,7 +810,8 @@ def render_new_deal(db: dict[str, Any]) -> None:
             },
         )
         st.session_state["selected_deal_id"] = deal["id"]
-        st.session_state["page"] = "案件詳細"
+        st.session_state["reset_new_deal_form"] = True
+        st.session_state[NAV_REQUEST_KEY] = "案件詳細"
         st.success("案件を登録しました。")
         st.rerun()
 
@@ -795,6 +829,7 @@ def select_deal(db: dict[str, Any], include_past: bool = False) -> dict[str, Any
         deals,
         index=index,
         format_func=lambda deal: f"{deal['title']}（{deal['phase']}）",
+        key=f"deal-selector-{'past' if include_past else 'active'}",
     )
     st.session_state["selected_deal_id"] = selected["id"]
     return selected
@@ -805,23 +840,23 @@ def render_overview_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
     with left:
         with st.form(f"overview-{deal['id']}"):
             st.subheader("案件概要")
-            title = st.text_input("案件名", value=deal["title"])
-            customer_name = st.text_input("顧客名", value=deal["customer_name"])
-            customer_industry = st.text_input("業界", value=deal["customer_industry"])
-            customer_size = st.selectbox("企業規模", CUSTOMER_SIZES, index=CUSTOMER_SIZES.index(deal.get("customer_size", "31～50")) if deal.get("customer_size") in CUSTOMER_SIZES else 0)
-            department_name = st.selectbox("部署", DEPARTMENTS, index=DEPARTMENTS.index(deal.get("department_name")) if deal.get("department_name") in DEPARTMENTS else 0)
-            contact_name = st.text_input("担当者", value=deal.get("contact_name") or "")
-            contact_role = st.selectbox("担当者役職", CONTACT_ROLES, index=CONTACT_ROLES.index(deal.get("contact_role")) if deal.get("contact_role") in CONTACT_ROLES else 0)
-            product_name = st.text_input("提案商材", value=deal["product_name"])
-            product_url = st.text_input("商材URL", value=deal.get("product_url") or "")
-            product_description = st.text_area("提案商材の概要", value=deal.get("product_description") or "", height=100)
-            phase = st.selectbox("商談フェーズ", PHASES, index=PHASES.index(deal.get("phase")) if deal.get("phase") in PHASES else 0)
-            temperature = st.selectbox("温度感", TEMPERATURES, index=TEMPERATURES.index(deal.get("temperature")) if deal.get("temperature") in TEMPERATURES else 1)
-            budget = st.selectbox("予算感", BUDGET_RANGES, index=BUDGET_RANGES.index(deal.get("budget")) if deal.get("budget") in BUDGET_RANGES else 0)
-            next_meeting_date = st.text_input("次回予定日", value=deal.get("next_meeting_date") or "", placeholder="YYYY-MM-DD")
-            target_close_date = st.text_input("導入予定日（受注目標日）", value=deal.get("target_close_date") or "", placeholder="YYYY-MM-DD")
-            competitor_info = st.text_area("競合情報", value=deal.get("competitor_info") or "")
-            memo = st.text_area("メモ", value=deal.get("memo") or "")
+            title = st.text_input("案件名", value=deal["title"], key=f"overview-title-{deal['id']}")
+            customer_name = st.text_input("顧客名", value=deal["customer_name"], key=f"overview-customer-{deal['id']}")
+            customer_industry = st.text_input("業界", value=deal["customer_industry"], key=f"overview-industry-{deal['id']}")
+            customer_size = st.selectbox("企業規模", CUSTOMER_SIZES, index=CUSTOMER_SIZES.index(deal.get("customer_size", "31～50")) if deal.get("customer_size") in CUSTOMER_SIZES else 0, key=f"overview-size-{deal['id']}")
+            department_name = st.selectbox("部署", DEPARTMENTS, index=DEPARTMENTS.index(deal.get("department_name")) if deal.get("department_name") in DEPARTMENTS else 0, key=f"overview-department-{deal['id']}")
+            contact_name = st.text_input("担当者", value=deal.get("contact_name") or "", key=f"overview-contact-{deal['id']}")
+            contact_role = st.selectbox("担当者役職", CONTACT_ROLES, index=CONTACT_ROLES.index(deal.get("contact_role")) if deal.get("contact_role") in CONTACT_ROLES else 0, key=f"overview-role-{deal['id']}")
+            product_name = st.text_input("提案商材", value=deal["product_name"], key=f"overview-product-{deal['id']}")
+            product_url = st.text_input("商材URL", value=deal.get("product_url") or "", key=f"overview-url-{deal['id']}")
+            product_description = st.text_area("提案商材の概要", value=deal.get("product_description") or "", height=100, key=f"overview-description-{deal['id']}")
+            phase = st.selectbox("商談フェーズ", PHASES, index=PHASES.index(deal.get("phase")) if deal.get("phase") in PHASES else 0, key=f"overview-phase-{deal['id']}")
+            temperature = st.selectbox("温度感", TEMPERATURES, index=TEMPERATURES.index(deal.get("temperature")) if deal.get("temperature") in TEMPERATURES else 1, key=f"overview-temperature-{deal['id']}")
+            budget = st.selectbox("予算感", BUDGET_RANGES, index=BUDGET_RANGES.index(deal.get("budget")) if deal.get("budget") in BUDGET_RANGES else 0, key=f"overview-budget-{deal['id']}")
+            next_meeting_date = st.text_input("次回予定日", value=deal.get("next_meeting_date") or "", placeholder="YYYY-MM-DD", key=f"overview-next-date-{deal['id']}")
+            target_close_date = st.text_input("導入予定日（受注目標日）", value=deal.get("target_close_date") or "", placeholder="YYYY-MM-DD", key=f"overview-target-date-{deal['id']}")
+            competitor_info = st.text_area("競合情報", value=deal.get("competitor_info") or "", key=f"overview-competitor-{deal['id']}")
+            memo = st.text_area("メモ", value=deal.get("memo") or "", key=f"overview-memo-{deal['id']}")
             submitted = st.form_submit_button("概要を保存", type="primary")
             if submitted:
                 update_deal(
@@ -858,15 +893,15 @@ def render_overview_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
         st.divider()
         st.subheader("ステータス変更")
         col1, col2, col3 = st.columns(3)
-        if col1.button("受注"):
+        if col1.button("受注", key=f"status-won-{deal['id']}"):
             update_deal(db, deal["id"], {"status": "won", "phase": "受注"})
             save_db(db)
             st.rerun()
-        if col2.button("失注"):
+        if col2.button("失注", key=f"status-lost-{deal['id']}"):
             update_deal(db, deal["id"], {"status": "lost", "phase": "失注"})
             save_db(db)
             st.rerun()
-        if col3.button("ペンディング"):
+        if col3.button("ペンディング", key=f"status-pending-{deal['id']}"):
             update_deal(db, deal["id"], {"phase": "ペンディング"})
             save_db(db)
             st.rerun()
@@ -879,11 +914,11 @@ def render_research_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
     left, right = st.columns([1, 2])
     with left:
         st.subheader("商談前情報")
-        meeting_minutes = st.number_input("商談時間（分）", min_value=1, value=45)
-        pre_meeting_info = st.text_area("事前情報", height=120)
-        visible_needs = st.text_area("顕在化しているニーズ", height=120)
-        requirements = st.text_area("要件", height=120)
-        if st.button("商談前リサーチを生成", type="primary"):
+        meeting_minutes = st.number_input("商談時間（分）", min_value=1, value=45, key=f"research-meeting-minutes-{deal['id']}")
+        pre_meeting_info = st.text_area("事前情報", height=120, key=f"research-info-{deal['id']}")
+        visible_needs = st.text_area("顕在化しているニーズ", height=120, key=f"research-needs-{deal['id']}")
+        requirements = st.text_area("要件", height=120, key=f"research-requirements-{deal['id']}")
+        if st.button("商談前リサーチを生成", type="primary", key=f"generate-research-{deal['id']}"):
             context = {
                 "meeting_minutes": meeting_minutes,
                 "pre_meeting_info": pre_meeting_info,
@@ -905,12 +940,12 @@ def render_hearing_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
     left, right = st.columns([1, 2])
     with left:
         st.subheader("ヒアリング時間配分")
-        meeting_minutes = st.number_input("商談時間（分）", min_value=1, value=45)
-        opening_minutes = st.number_input("うちアイスブレイク/冒頭ヒアリング時間（分）", min_value=0, value=5)
-        product_demo_minutes = st.number_input("うち製品説明時間（分）", min_value=0, value=15)
-        post_demo_hearing_minutes = st.number_input("うち紹介後ヒアリング時間（分）", min_value=0, value=15)
-        closing_minutes = st.number_input("うちクロージング/次回アクション合意時間（分）", min_value=0, value=10)
-        if st.button("ヒアリング設計を生成", type="primary"):
+        meeting_minutes = st.number_input("商談時間（分）", min_value=1, value=45, key=f"hearing-meeting-minutes-{deal['id']}")
+        opening_minutes = st.number_input("うちアイスブレイク/冒頭ヒアリング時間（分）", min_value=0, value=5, key=f"hearing-opening-{deal['id']}")
+        product_demo_minutes = st.number_input("うち製品説明時間（分）", min_value=0, value=15, key=f"hearing-demo-{deal['id']}")
+        post_demo_hearing_minutes = st.number_input("うち紹介後ヒアリング時間（分）", min_value=0, value=15, key=f"hearing-post-demo-{deal['id']}")
+        closing_minutes = st.number_input("うちクロージング/次回アクション合意時間（分）", min_value=0, value=10, key=f"hearing-closing-{deal['id']}")
+        if st.button("ヒアリング設計を生成", type="primary", key=f"generate-hearing-{deal['id']}"):
             context = {
                 "meeting_minutes": meeting_minutes,
                 "opening_minutes": opening_minutes,
@@ -933,13 +968,13 @@ def render_meeting_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
     left, right = st.columns([1, 2])
     with left:
         st.subheader("商談メモ貼り付け")
-        meeting_at = st.text_input("商談日時", placeholder="2026-07-01 10:00")
-        meeting_type = st.selectbox("商談形式", MEETING_TYPES, index=1)
-        duration_minutes = st.number_input("商談時間（分）", min_value=1, value=45)
-        participants = st.text_input("参加者")
-        transcript = st.text_area("商談メモ本文", height=260)
-        supplemental_memo = st.text_area("補足メモ", height=100)
-        if st.button("商談メモを分析", type="primary"):
+        meeting_at = st.text_input("商談日時", placeholder="2026-07-01 10:00", key=f"meeting-at-{deal['id']}")
+        meeting_type = st.selectbox("商談形式", MEETING_TYPES, index=1, key=f"meeting-type-{deal['id']}")
+        duration_minutes = st.number_input("商談時間（分）", min_value=1, value=45, key=f"meeting-duration-{deal['id']}")
+        participants = st.text_input("参加者", key=f"meeting-participants-{deal['id']}")
+        transcript = st.text_area("商談メモ本文", height=260, key=f"meeting-transcript-{deal['id']}")
+        supplemental_memo = st.text_area("補足メモ", height=100, key=f"meeting-supplement-{deal['id']}")
+        if st.button("商談メモを分析", type="primary", key=f"generate-meeting-{deal['id']}"):
             if not transcript:
                 st.error("商談メモ本文を入力してください。")
                 return
@@ -965,7 +1000,7 @@ def render_meeting_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
 
 
 def render_email_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
-    if st.button("お礼メールを生成", type="primary"):
+    if st.button("お礼メールを生成", type="primary", key=f"generate-email-{deal['id']}"):
         try:
             with st.spinner("メール文面を生成しています..."):
                 run_ai_and_store(db, deal, "email", build_email_prompt(deal, db), quality="light")
@@ -981,21 +1016,22 @@ def render_proposal_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
     meeting_analysis = latest_output(db, deal["id"], "meeting_analysis")
     with left:
         st.subheader("提案資料作成条件")
-        next_meeting_minutes = st.number_input("次回商談時間（分）", min_value=1, value=45)
+        next_meeting_minutes = st.number_input("次回商談時間（分）", min_value=1, value=45, key=f"proposal-next-minutes-{deal['id']}")
         previous_meeting_analysis = st.text_area(
             "前回議事メモ分析入力",
             value=meeting_analysis["output_text"] if meeting_analysis else "",
             height=180,
+            key=f"proposal-previous-analysis-{deal['id']}",
         )
-        proposal_purpose = st.selectbox("目的", ["決裁者面談", "運用提案", "稟議用資料"], index=1)
-        expected_attendees = st.text_input("想定参加者/決裁者", placeholder="例: 部長、現場責任者、経営層")
-        key_message = st.text_area("資料で最も伝えたいメッセージ", height=90)
-        must_include_points = st.text_area("必ず入れたい項目/スライド", height=90)
-        decision_criteria = st.text_area("判断基準", height=90)
-        budget_or_approval_conditions = st.text_area("予算/稟議条件", height=90)
-        competitor_or_concerns = st.text_area("競合・懸念・反論されそうな点", height=90)
-        desired_next_action = st.text_input("資料提示後に合意したい次回アクション")
-        if st.button("提案資料骨子を生成", type="primary"):
+        proposal_purpose = st.selectbox("目的", ["決裁者面談", "運用提案", "稟議用資料"], index=1, key=f"proposal-purpose-{deal['id']}")
+        expected_attendees = st.text_input("想定参加者/決裁者", placeholder="例: 部長、現場責任者、経営層", key=f"proposal-attendees-{deal['id']}")
+        key_message = st.text_area("資料で最も伝えたいメッセージ", height=90, key=f"proposal-key-message-{deal['id']}")
+        must_include_points = st.text_area("必ず入れたい項目/スライド", height=90, key=f"proposal-must-include-{deal['id']}")
+        decision_criteria = st.text_area("判断基準", height=90, key=f"proposal-criteria-{deal['id']}")
+        budget_or_approval_conditions = st.text_area("予算/稟議条件", height=90, key=f"proposal-budget-{deal['id']}")
+        competitor_or_concerns = st.text_area("競合・懸念・反論されそうな点", height=90, key=f"proposal-concerns-{deal['id']}")
+        desired_next_action = st.text_input("資料提示後に合意したい次回アクション", key=f"proposal-next-action-{deal['id']}")
+        if st.button("提案資料骨子を生成", type="primary", key=f"generate-proposal-{deal['id']}"):
             context = {
                 "next_meeting_minutes": next_meeting_minutes,
                 "previous_meeting_analysis": previous_meeting_analysis,
@@ -1025,7 +1061,7 @@ def render_timeline_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
     st.caption("各フェーズに日付を入力できます。商談メモ分析後は、次回予定日や受注目標日を自動反映できます。")
     dates = dict(deal.get("timeline_dates") or {})
 
-    if st.button("商談メモから期日を自動反映"):
+    if st.button("商談メモから期日を自動反映", key=f"timeline-auto-{deal['id']}"):
         current_phase = deal.get("phase") if deal.get("phase") in TIMELINE_PHASES else "2回目以降面談前/運用提案前"
         if deal.get("next_meeting_date"):
             dates[current_phase] = deal["next_meeting_date"]
@@ -1038,7 +1074,7 @@ def render_timeline_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
 
     with st.form(f"timeline-{deal['id']}"):
         for phase in TIMELINE_PHASES:
-            dates[phase] = st.text_input(phase, value=dates.get(phase, ""), placeholder="YYYY-MM-DD")
+            dates[phase] = st.text_input(phase, value=dates.get(phase, ""), placeholder="YYYY-MM-DD", key=f"timeline-{deal['id']}-{phase}")
         if st.form_submit_button("タイムラインを保存", type="primary"):
             update_deal(db, deal["id"], {"timeline_dates": dates})
             save_db(db)
@@ -1050,8 +1086,8 @@ def render_timeline_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
 
 def render_winloss_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
     col1, col2 = st.columns(2)
-    result = "won" if col1.button("受注分析を生成") else None
-    result = "lost" if col2.button("失注分析を生成") else result
+    result = "won" if col1.button("受注分析を生成", key=f"winloss-won-{deal['id']}") else None
+    result = "lost" if col2.button("失注分析を生成", key=f"winloss-lost-{deal['id']}") else result
     if result:
         try:
             with st.spinner("過去案件分析を生成しています..."):
@@ -1185,8 +1221,16 @@ def main() -> None:
     st.markdown(
         """
         <style>
-        .block-container { padding-top: 1.6rem; }
+        .block-container { padding-top: 1.4rem; padding-bottom: 3rem; max-width: 1280px; }
         div[data-testid="stMetric"] { background: #f8fafc; border: 1px solid #e2e8f0; padding: 12px; border-radius: 8px; }
+        div[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 8px; }
+        div[data-testid="stButton"] > button,
+        div[data-testid="stDownloadButton"] > button,
+        div[data-testid="stLinkButton"] > a { min-height: 2.5rem; border-radius: 8px; }
+        div[data-baseweb="tab-list"] { gap: .15rem; flex-wrap: wrap; }
+        div[data-baseweb="tab"] { padding: .55rem .75rem; white-space: nowrap; }
+        div[data-testid="stDataFrame"] { border: 1px solid #e2e8f0; border-radius: 8px; }
+        textarea { min-height: 5rem; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1199,8 +1243,11 @@ def main() -> None:
     st.sidebar.title(APP_NAME)
     st.sidebar.caption("Streamlit MVP")
     pages = ["ダッシュボード", "新規案件登録", "案件詳細", "過去案件分析", "利用状況", "公開手順"]
-    default_page = st.session_state.get("page", "ダッシュボード")
-    page = st.sidebar.radio("メニュー", pages, index=pages.index(default_page) if default_page in pages else 0, key="page")
+    requested_page = st.session_state.pop(NAV_REQUEST_KEY, None)
+    if requested_page in pages:
+        st.session_state[NAV_KEY] = requested_page
+    default_page = st.session_state.get(NAV_KEY, "ダッシュボード")
+    page = st.sidebar.radio("メニュー", pages, index=pages.index(default_page) if default_page in pages else 0, key=NAV_KEY)
     st.sidebar.divider()
     st.sidebar.caption("セキュリティ/注意事項")
     st.sidebar.write("入力情報は、このユーザーへのAIレスポンス生成にのみ利用する前提です。")
