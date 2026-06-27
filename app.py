@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import html
 import json
@@ -709,7 +709,7 @@ def render_dashboard(db: dict[str, Any]) -> None:
         rows.append(row)
 
     st.subheader("案件別タイムスケジュール")
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
     st.subheader("ネクストアクション")
     for deal in deals:
@@ -907,7 +907,7 @@ def render_overview_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
             st.rerun()
         st.divider()
         st.subheader("案件タイムライン")
-        st.dataframe(pd.DataFrame(timeline_status(deal)), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(timeline_status(deal)), width="stretch", hide_index=True)
 
 
 def render_research_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
@@ -1081,7 +1081,7 @@ def render_timeline_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
             st.success("タイムラインを保存しました。")
             st.rerun()
 
-    st.dataframe(pd.DataFrame(timeline_status({**deal, "timeline_dates": dates})), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(timeline_status({**deal, "timeline_dates": dates})), width="stretch", hide_index=True)
 
 
 def render_winloss_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
@@ -1159,7 +1159,7 @@ def render_past_deals(db: dict[str, Any]) -> None:
         }
         for deal in deals
     ]
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
     st.divider()
     deal = select_deal({"deals": deals, "ai_outputs": db["ai_outputs"], "usage": db["usage"]}, include_past=True)
     if deal:
@@ -1245,8 +1245,10 @@ def main() -> None:
     pages = ["ダッシュボード", "新規案件登録", "案件詳細", "過去案件分析", "利用状況", "公開手順"]
     requested_page = st.session_state.pop(NAV_REQUEST_KEY, None)
     if requested_page in pages:
-        st.session_state[NAV_KEY] = requested_page
-    default_page = st.session_state.get(NAV_KEY, "ダッシュボード")
+        st.session_state.pop(NAV_KEY, None)
+        default_page = requested_page
+    else:
+        default_page = st.session_state.get(NAV_KEY, "ダッシュボード")
     page = st.sidebar.radio("メニュー", pages, index=pages.index(default_page) if default_page in pages else 0, key=NAV_KEY)
     st.sidebar.divider()
     st.sidebar.caption("セキュリティ/注意事項")
@@ -1268,3 +1270,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
