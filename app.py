@@ -1487,6 +1487,7 @@ def render_proposal_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
                 st.error(str(exc))
     with right:
         render_output(latest_output(db, deal["id"], "proposal_outline"), db, deal, key_prefix="latest-proposal")
+        st.info('上記メモをコピーし、ChatGPTで「メモを基にスライドをpptxで出力してください」と投稿してください（推奨モード：Thinking以上）')
         st.link_button("ChatGPTを開く", "https://chatgpt.com/")
 
 
