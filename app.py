@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import html
+import hashlib
 import json
 import re
 import uuid
@@ -37,6 +38,8 @@ HIGH_MODEL = get_secret("OPENAI_MODEL_HIGH", "gpt-5.4")
 LIGHT_MODEL = get_secret("OPENAI_MODEL_LIGHT", "gpt-5.4-mini")
 MAX_PROMPT_CHARS = int(get_secret("MAX_PROMPT_CHARS", 24_000))
 LONG_PROMPT_SUMMARY_CHARS = int(get_secret("LONG_PROMPT_SUMMARY_CHARS", 18_000))
+SHORT_INPUT_CONFIRM_CHARS = int(get_secret("SHORT_INPUT_CONFIRM_CHARS", 12_000))
+DEFAULT_QUALITY_MODE = get_secret("DEFAULT_QUALITY_MODE", "標準")
 
 PHASES = [
     "コンタクト前",
@@ -152,15 +155,17 @@ AI_LABELS = {
 }
 
 OUTPUT_TOKEN_LIMITS = {
-    "product_summary": 320,
-    "research": 2200,
-    "hearing": 2400,
-    "meeting_analysis": 2200,
-    "email": 1200,
-    "proposal_outline": 3800,
-    "win_loss_analysis": 1800,
-    "output_refinement": 1600,
+    "product_summary": 260,
+    "research": 1500,
+    "hearing": 1600,
+    "meeting_analysis": 1600,
+    "email": 750,
+    "proposal_outline": 2600,
+    "win_loss_analysis": 1200,
+    "output_refinement": 900,
 }
+
+QUALITY_MODES = ["エコノミー", "標準", "高品質"]
 
 ACTION_TO_TAB = {
     "商談前リサーチ": "商談前リサーチ",
@@ -192,7 +197,7 @@ def month_key() -> str:
 
 
 def empty_db() -> dict[str, Any]:
-    return {"deals": [], "ai_outputs": [], "usage": {}, "url_cache": {}}
+    return {"deals": [], "ai_outputs": [], "usage": {}, "url_cache": {}, "ai_cache": {}}
 
 
 def load_db() -> dict[str, Any]:
@@ -208,6 +213,7 @@ def load_db() -> dict[str, Any]:
     data.setdefault("ai_outputs", [])
     data.setdefault("usage", {})
     data.setdefault("url_cache", {})
+    data.setdefault("ai_cache", {})
     return data
 
 
@@ -323,6 +329,32 @@ def add_ai_output(
     )
 
 
+def cache_key_for(output_type: str, prompt: str, quality: str, max_output_tokens: int | None) -> str:
+    raw = json.dumps(
+        {
+            "type": output_type,
+            "quality": quality,
+            "max_output_tokens": max_output_tokens,
+            "prompt": trim_prompt(prompt),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def get_cached_ai_output(db: dict[str, Any], key: str) -> dict[str, Any] | None:
+    return db.setdefault("ai_cache", {}).get(key)
+
+
+def set_cached_ai_output(db: dict[str, Any], key: str, output_text: str, model: str) -> None:
+    db.setdefault("ai_cache", {})[key] = {
+        "output_text": output_text,
+        "model": model,
+        "created_at": now_iso(),
+    }
+
+
 def trim_prompt(prompt: str) -> str:
     if len(prompt) <= MAX_PROMPT_CHARS:
         return prompt
@@ -332,6 +364,44 @@ def trim_prompt(prompt: str) -> str:
         f"{head}\n\n"
         "[注: 入力が長いため、中央部分を省略しています。重要な判断は残っている情報をもとに行ってください。]\n\n"
         f"{tail}"
+    )
+
+
+def compact_text(text: str, limit: int = 1200) -> str:
+    text = re.sub(r"\n{3,}", "\n\n", text or "").strip()
+    if len(text) <= limit:
+        return text
+    head = text[: int(limit * 0.68)].rstrip()
+    tail = text[-int(limit * 0.22):].lstrip()
+    return f"{head}\n\n[中略]\n\n{tail}"
+
+
+def quality_from_mode(output_type: str, default_quality: str = "high") -> str:
+    mode = st.session_state.get("quality_mode", DEFAULT_QUALITY_MODE)
+    if mode == "エコノミー":
+        return "light"
+    if mode == "高品質":
+        return default_quality
+    return "high" if output_type in {"meeting_analysis", "proposal_outline"} else "light"
+
+
+def token_limit_for(output_type: str) -> int:
+    mode = st.session_state.get("quality_mode", DEFAULT_QUALITY_MODE)
+    base = OUTPUT_TOKEN_LIMITS.get(output_type, 1200)
+    if mode == "エコノミー":
+        return max(240, int(base * 0.7))
+    if mode == "高品質":
+        return int(base * 1.15)
+    return base
+
+
+def short_input_enabled(key: str, text: str) -> bool:
+    if len(text or "") <= SHORT_INPUT_CONFIRM_CHARS:
+        return True
+    return st.checkbox(
+        "入力が長いため、AIに渡す前に自動短縮して原価を抑える",
+        value=True,
+        key=key,
     )
 
 
@@ -389,6 +459,16 @@ def run_ai_and_store(
     prompt: str,
     quality: str = "high",
 ) -> str:
+    quality = quality_from_mode(output_type, quality)
+    max_output_tokens = token_limit_for(output_type)
+    cache_key = cache_key_for(output_type, prompt, quality, max_output_tokens)
+    cached = get_cached_ai_output(db, cache_key)
+    if cached:
+        add_ai_output(db, deal["id"], output_type, f"[キャッシュ再利用]\n\n{prompt}", cached["output_text"], f"cache:{cached['model']}", 0)
+        update_deal_context_summary(db, deal["id"])
+        save_db(db)
+        return cached["output_text"]
+
     credits = AI_CREDIT_COSTS[output_type]
     if needs_long_prompt_summary(prompt, output_type):
         credits += AI_CREDIT_COSTS["output_refinement"]
@@ -401,23 +481,21 @@ def run_ai_and_store(
     output_text, model = run_openai(
         prompt_for_generation,
         quality=quality,
-        max_output_tokens=OUTPUT_TOKEN_LIMITS.get(output_type),
+        max_output_tokens=max_output_tokens,
     )
     stored_prompt = prompt
     if summary_model:
         stored_prompt = f"[長文入力を{summary_model}で要約後に生成]\n\n{prompt}"
     register_ai_usage(db, credits)
     add_ai_output(db, deal["id"], output_type, stored_prompt, output_text, model, credits)
+    set_cached_ai_output(db, cache_key, output_text, model)
+    update_deal_context_summary(db, deal["id"])
     save_db(db)
     return output_text
 
 
 def refine_output(db: dict[str, Any], deal: dict[str, Any], output: dict[str, Any], mode: str, instruction: str) -> str:
     credits = AI_CREDIT_COSTS["output_refinement"]
-    if not can_use_ai(db, credits):
-        raise RuntimeError(
-            f"今月のAI利用上限を超えます。現在 {get_usage(db)['ai_credits']} / {MONTHLY_AI_LIMIT} クレジット利用済みです。"
-        )
     prompt = f"""
 以下のAI出力を、指定された目的に合わせて整えてください。
 全文を作り直さず、必要な範囲だけを直してください。元の重要情報は保持してください。
@@ -431,13 +509,27 @@ def refine_output(db: dict[str, Any], deal: dict[str, Any], output: dict[str, An
 元の出力:
 {output.get("output_text")}
 """.strip()
+    max_output_tokens = token_limit_for("output_refinement")
+    cache_key = cache_key_for("output_refinement", prompt, "light", max_output_tokens)
+    cached = get_cached_ai_output(db, cache_key)
+    if cached:
+        add_ai_output(db, deal["id"], output["type"], f"[キャッシュ再利用]\n\n{prompt}", cached["output_text"], f"cache:{cached['model']}", 0)
+        save_db(db)
+        return cached["output_text"]
+
+    if not can_use_ai(db, credits):
+        raise RuntimeError(
+            f"今月のAI利用上限を超えます。現在 {get_usage(db)['ai_credits']} / {MONTHLY_AI_LIMIT} クレジット利用済みです。"
+        )
     refined_text, model = run_openai(
         prompt,
         quality="light",
-        max_output_tokens=OUTPUT_TOKEN_LIMITS["output_refinement"],
+        max_output_tokens=max_output_tokens,
     )
     register_ai_usage(db, credits)
     add_ai_output(db, deal["id"], output["type"], prompt, refined_text, model, credits)
+    set_cached_ai_output(db, cache_key, refined_text, model)
+    update_deal_context_summary(db, deal["id"])
     save_db(db)
     return refined_text
 
@@ -611,9 +703,38 @@ def render_onboarding_guide(has_deals: bool) -> None:
                     st.caption("先に案件を登録してください。")
 
 
+def update_deal_context_summary(db: dict[str, Any], deal_id: str) -> None:
+    deal = find_deal(db, deal_id)
+    if not deal:
+        return
+    parts = [
+        f"案件名: {deal.get('title')}",
+        f"顧客: {deal.get('customer_name')} / 業界: {deal.get('customer_industry')} / 規模: {deal.get('customer_size')}",
+        f"部署・担当: {deal.get('department_name')} / {deal.get('contact_name') or '未設定'} / {deal.get('contact_role')}",
+        f"商材: {deal.get('product_name')}",
+        f"商材概要: {compact_text(deal.get('product_description') or '', 500)}",
+        f"フェーズ: {deal.get('phase')} / 温度感: {deal.get('temperature')} / 予算: {deal.get('budget')}",
+        f"次回予定日: {format_date(deal.get('next_meeting_date'))} / 受注目標: {format_date(deal.get('target_close_date'))}",
+    ]
+    if deal.get("competitor_info"):
+        parts.append(f"競合情報: {compact_text(deal.get('competitor_info'), 300)}")
+    if deal.get("memo"):
+        parts.append(f"メモ: {compact_text(deal.get('memo'), 500)}")
+    for output_type in ["research", "meeting_analysis", "proposal_outline", "win_loss_analysis"]:
+        output = latest_output(db, deal_id, output_type)
+        if output:
+            parts.append(f"{AI_LABELS.get(output_type, output_type)}要約:\n{compact_text(output.get('output_text') or '', 900)}")
+    deal["ai_context_summary"] = "\n\n".join(part for part in parts if part)
+    deal["ai_context_summary_updated_at"] = now_iso()
+
+
 def deal_context(deal: dict[str, Any], db: dict[str, Any] | None = None) -> str:
-    latest_research = latest_output(db, deal["id"], "research")["output_text"] if db and latest_output(db, deal["id"], "research") else ""
-    latest_analysis = latest_output(db, deal["id"], "meeting_analysis")["output_text"] if db and latest_output(db, deal["id"], "meeting_analysis") else ""
+    if deal.get("ai_context_summary"):
+        return deal["ai_context_summary"]
+    latest_research_output = latest_output(db, deal["id"], "research") if db else None
+    latest_analysis_output = latest_output(db, deal["id"], "meeting_analysis") if db else None
+    latest_research = compact_text(latest_research_output["output_text"], 900) if latest_research_output else ""
+    latest_analysis = compact_text(latest_analysis_output["output_text"], 900) if latest_analysis_output else ""
     timeline = "\n".join(
         f"- {phase}: {date_value}"
         for phase, date_value in (deal.get("timeline_dates") or {}).items()
@@ -908,6 +1029,34 @@ def build_email_prompt(deal: dict[str, Any], db: dict[str, Any]) -> str:
 """.strip()
 
 
+def build_email_template(deal: dict[str, Any], db: dict[str, Any]) -> str:
+    meeting_analysis = latest_output(db, deal["id"], "meeting_analysis")
+    analysis_note = compact_text(meeting_analysis["output_text"], 700) if meeting_analysis else "商談メモ分析はまだありません。商談で合意した内容を追記してください。"
+    next_action = "、".join(recommended_next_actions(db, deal)[:2])
+    return f"""
+# お礼メール案（テンプレート）
+## 件名
+{deal.get("customer_name")}様 / 本日のお打ち合わせのお礼と次回の進め方
+
+## 本文
+{deal.get("customer_name")}
+{deal.get("contact_name") or "ご担当者"} 様
+
+本日はお時間をいただき、ありがとうございました。
+お話しいただいた内容を踏まえ、{deal.get("product_name")}のご提案に向けて、下記の通り整理しました。
+
+## 本日の確認内容
+{analysis_note}
+
+## 次回アクション
+- 次に進めること: {next_action or "次回アクションの確認"}
+- 次回予定日: {format_date(deal.get("next_meeting_date"))}
+- 導入予定日（受注目標日）: {format_date(deal.get("target_close_date"))}
+
+引き続きよろしくお願いいたします。
+""".strip()
+
+
 def build_proposal_prompt(deal: dict[str, Any], context: dict[str, Any], db: dict[str, Any]) -> str:
     return f"""
 以下の案件について、提案資料骨子を作成してください。
@@ -1011,7 +1160,7 @@ def render_output_tools(output: dict[str, Any], db: dict[str, Any] | None, deal:
         return
     mode = st.selectbox(
         "整形方法",
-        ["短く要約", "提案資料向けに整える", "指定部分だけ修正"],
+        ["指定部分だけ修正", "短く要約", "提案資料向けに整える"],
         key=f"refine-mode-{key_prefix}-{output['id']}",
     )
     instruction = st.text_area(
@@ -1181,19 +1330,29 @@ def render_new_deal(db: dict[str, Any]) -> None:
                     st.session_state["new_product_description"] = cached["summary"]
                     st.success("保存済みの商材概要を再利用しました。AIクレジットは消費していません。")
                     st.rerun()
-                if not can_use_ai(db, AI_CREDIT_COSTS["product_summary"]):
-                    st.error(
-                        f"今月のAI利用上限を超えます。現在 {get_usage(db)['ai_credits']} / {MONTHLY_AI_LIMIT} クレジット利用済みです。"
-                    )
-                    return
                 page_text = extract_url_text(product_url)
                 prompt = build_product_summary_prompt(product_name, product_url, page_text)
-                summary, _model = run_openai(
-                    prompt,
-                    quality="light",
-                    max_output_tokens=OUTPUT_TOKEN_LIMITS["product_summary"],
-                )
-                register_ai_usage(db, AI_CREDIT_COSTS["product_summary"])
+                max_output_tokens = token_limit_for("product_summary")
+                ai_cache_key = cache_key_for("product_summary", prompt, "light", max_output_tokens)
+                cached_ai = get_cached_ai_output(db, ai_cache_key)
+                if cached_ai:
+                    summary = cached_ai["output_text"]
+                    _model = cached_ai["model"]
+                    reused_ai_cache = True
+                else:
+                    if not can_use_ai(db, AI_CREDIT_COSTS["product_summary"]):
+                        st.error(
+                            f"今月のAI利用上限を超えます。現在 {get_usage(db)['ai_credits']} / {MONTHLY_AI_LIMIT} クレジット利用済みです。"
+                        )
+                        return
+                    summary, _model = run_openai(
+                        prompt,
+                        quality="light",
+                        max_output_tokens=max_output_tokens,
+                    )
+                    register_ai_usage(db, AI_CREDIT_COSTS["product_summary"])
+                    set_cached_ai_output(db, ai_cache_key, summary.strip(), _model)
+                    reused_ai_cache = False
                 db.setdefault("url_cache", {})[cache_key] = {
                     "summary": summary.strip(),
                     "product_name": product_name,
@@ -1201,7 +1360,7 @@ def render_new_deal(db: dict[str, Any]) -> None:
                 }
                 save_db(db)
                 st.session_state["new_product_description"] = summary.strip()
-                st.success("商材概要を作成しました。")
+                st.success("保存済みの商材概要を再利用しました。AIクレジットは消費していません。" if reused_ai_cache else "商材概要を作成しました。")
             except Exception as exc:
                 st.error(str(exc))
         st.text_area("提案商材の概要", key="new_product_description", height=100)
@@ -1316,6 +1475,7 @@ def render_overview_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
                         "memo": memo,
                     },
                 )
+                update_deal_context_summary(db, deal["id"])
                 save_db(db)
                 st.success("案件概要を保存しました。")
                 st.rerun()
@@ -1407,6 +1567,7 @@ def render_meeting_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
         duration_minutes = st.number_input("商談時間（分）", min_value=1, value=45, key=f"meeting-duration-{deal['id']}")
         participants = st.text_input("参加者", key=f"meeting-participants-{deal['id']}")
         transcript = st.text_area("商談メモ本文", height=260, key=f"meeting-transcript-{deal['id']}")
+        use_short_transcript = short_input_enabled(f"short-meeting-transcript-{deal['id']}", transcript)
         supplemental_memo = st.text_area("補足メモ", height=100, key=f"meeting-supplement-{deal['id']}")
         if st.button("商談メモを分析", type="primary", key=f"generate-meeting-{deal['id']}"):
             if not transcript:
@@ -1417,13 +1578,14 @@ def render_meeting_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
                 "meeting_type": meeting_type,
                 "duration_minutes": duration_minutes,
                 "participants": participants,
-                "transcript": transcript,
+                "transcript": compact_text(transcript, 9000) if use_short_transcript else transcript,
                 "supplemental_memo": supplemental_memo,
             }
             try:
                 with st.spinner("商談メモを分析しています..."):
                     run_ai_and_store(db, deal, "meeting_analysis", build_meeting_analysis_prompt(deal, context, db), quality="high")
                 update_deal(db, deal["id"], {"phase": "2回目以降面談前/運用提案前"})
+                update_deal_context_summary(db, deal["id"])
                 save_db(db)
                 st.success("分析しました。フェーズを「2回目以降面談前/運用提案前」に更新しました。")
                 st.rerun()
@@ -1434,7 +1596,14 @@ def render_meeting_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
 
 
 def render_email_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
-    if st.button("お礼メールを生成", type="primary", key=f"generate-email-{deal['id']}"):
+    col1, col2 = st.columns(2)
+    if col1.button("テンプレートで作成（無料）", type="secondary", key=f"template-email-{deal['id']}"):
+        output_text = build_email_template(deal, db)
+        add_ai_output(db, deal["id"], "email", "[テンプレート生成: AI未使用]", output_text, "template", 0)
+        save_db(db)
+        st.success("AIを使わずメールテンプレートを作成しました。")
+        st.rerun()
+    if col2.button("AIでお礼メールを生成", type="primary", key=f"generate-email-{deal['id']}"):
         try:
             with st.spinner("メール文面を生成しています..."):
                 run_ai_and_store(db, deal, "email", build_email_prompt(deal, db), quality="light")
@@ -1457,6 +1626,7 @@ def render_proposal_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
             height=180,
             key=f"proposal-previous-analysis-{deal['id']}",
         )
+        use_short_proposal_input = short_input_enabled(f"short-proposal-input-{deal['id']}", previous_meeting_analysis)
         proposal_purpose = st.selectbox("目的", ["決裁者面談", "運用提案", "稟議用資料"], index=1, key=f"proposal-purpose-{deal['id']}")
         expected_attendees = st.text_input("想定参加者/決裁者", placeholder="例: 部長、現場責任者、経営層", key=f"proposal-attendees-{deal['id']}")
         key_message = st.text_area("資料で最も伝えたいメッセージ", height=90, key=f"proposal-key-message-{deal['id']}")
@@ -1468,7 +1638,7 @@ def render_proposal_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
         if st.button("提案資料骨子を生成", type="primary", key=f"generate-proposal-{deal['id']}"):
             context = {
                 "next_meeting_minutes": next_meeting_minutes,
-                "previous_meeting_analysis": previous_meeting_analysis,
+                "previous_meeting_analysis": compact_text(previous_meeting_analysis, 5000) if use_short_proposal_input else previous_meeting_analysis,
                 "proposal_purpose": proposal_purpose,
                 "expected_attendees": expected_attendees,
                 "key_message": key_message,
@@ -1699,6 +1869,14 @@ def main() -> None:
     )
     if st.query_params.get(PAGE_QUERY_KEY) != page:
         st.query_params[PAGE_QUERY_KEY] = page
+    st.sidebar.divider()
+    st.sidebar.selectbox(
+        "AI品質モード",
+        QUALITY_MODES,
+        index=QUALITY_MODES.index(DEFAULT_QUALITY_MODE) if DEFAULT_QUALITY_MODE in QUALITY_MODES else 1,
+        key="quality_mode",
+        help="エコノミーは原価優先、標準は重要生成だけ高品質、高品質は品質優先です。",
+    )
     st.sidebar.divider()
     st.sidebar.caption("セキュリティ/注意事項")
     st.sidebar.write("入力情報は、このユーザーへのAIレスポンス生成にのみ利用する前提です。")
