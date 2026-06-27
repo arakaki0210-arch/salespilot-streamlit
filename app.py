@@ -28,6 +28,7 @@ DETAIL_VIEW_KEY = "detail_view"
 PAGE_QUERY_KEY = "page"
 PUBLIC_PAGES = ["サービス登録", "ログイン"]
 PROTECTED_PAGES = ["マイページ", "ダッシュボード", "新規案件登録", "案件詳細", "過去案件分析", "利用状況", "公開手順"]
+ADMIN_PAGES = ["ID/PASS発行"]
 PLAN_NAME = "SalesPilot AI スタータープラン"
 PLAN_PRICE_YEN = 1500
 PLAN_INTERVAL = "月額"
@@ -1284,76 +1285,40 @@ def render_policy_summary() -> None:
 **登録前の確認事項**
 
 - プランは **{PLAN_NAME} / {PLAN_INTERVAL}{PLAN_PRICE_YEN:,}円（税込想定）** です。
+- 初期版のサブスクリプション契約と解約は、noteメンバーシップ側で行います。
+- note契約後、運営者が契約確認を行い、ログインID/PASSを個別に通知します。
 - 入力した案件情報・商談メモは、本人の営業支援機能を提供する目的で利用します。
 - AI生成結果は営業判断を補助するもので、最終確認と顧客への送信判断はユーザー側で行います。
 - クレジット上限は月{MONTHLY_AI_LIMIT}クレジット、案件登録上限は月{MONTHLY_DEAL_LIMIT}件です。
 - 機密情報、個人番号、決済情報、パスワードなどの入力は避けてください。
-- 解約はマイページから申請できます。実決済連携後は決済事業者の請求サイクルに従います。
+- アプリのマイページでは契約状態の確認と利用停止申請ができます。
 """
     )
 
 
 def render_signup(db: dict[str, Any]) -> None:
-    st.title("SalesPilot登録")
-    st.caption("SNSやnoteから来た方向けの月額プラン登録画面です。")
+    st.title("SalesPilot登録案内")
+    st.caption("SNSやnoteから来た方向けの利用開始手順です。")
     render_policy_summary()
     st.divider()
 
-    issued = st.session_state.get("issued_credentials")
-    if issued:
-        st.success("登録が完了しました。以下のID/PASSはこの画面で一度だけ控えてください。")
-        col1, col2 = st.columns(2)
-        col1.code(issued["login_id"], language=None)
-        col2.code(issued["password"], language=None)
-        st.info("控えたら、ログイン画面からマイページへ進んでください。")
-        if st.button("ログイン画面へ進む", type="primary"):
-            st.session_state[NAV_REQUEST_KEY] = "ログイン"
-            st.rerun()
-        return
-
+    steps = pd.DataFrame(
+        [
+            {"手順": "1", "内容": "noteのSalesPilotメンバーシップで月額契約する"},
+            {"手順": "2", "内容": "noteの加入者名、メールアドレス、会社名を運営者へ連絡する"},
+            {"手順": "3", "内容": "運営者が契約確認後、ログインID/PASSを個別通知する"},
+            {"手順": "4", "内容": "このサイトのログイン画面からマイページへ進む"},
+        ]
+    )
+    st.dataframe(steps, width="stretch", hide_index=True)
+    st.info("この画面ではID/PASSは自動発行されません。note契約確認後に、運営者から通知されたID/PASSでログインしてください。")
     col1, col2 = st.columns(2)
     with col1:
-        name = st.text_input("氏名", placeholder="山田 太郎")
-        company = st.text_input("会社名/屋号", placeholder="株式会社〇〇")
-        email = st.text_input("メールアドレス", placeholder="name@example.com")
-        role = st.text_input("役職/担当", placeholder="代表、営業担当、営業責任者など")
+        st.link_button("noteで契約する", get_secret("NOTE_SUBSCRIPTION_URL", "https://note.com/"), type="primary")
     with col2:
-        team_size = st.selectbox("営業チーム規模", ["1人", "2～5人", "6～10人", "11人以上"])
-        source = st.selectbox("流入元", ["note", "X", "Threads", "紹介", "その他"])
-        use_case = st.text_area("使いたい目的", placeholder="商談メモ整理、提案資料骨子作成、次アクション管理など", height=120)
-
-    accept_terms = st.checkbox("利用規約、料金、解約条件を確認しました")
-    accept_privacy = st.checkbox("プライバシーポリシーとAI利用時のデータ取扱いを確認しました")
-    accept_commercial = st.checkbox(f"{PLAN_NAME}が{PLAN_INTERVAL}{PLAN_PRICE_YEN:,}円の有料サービスであることを確認しました")
-    submitted = st.button("登録してID/PASSを発行", type="primary")
-
-    if submitted:
-        if not name or not company or not email:
-            st.error("氏名、会社名/屋号、メールアドレスを入力してください。")
-            return
-        if "@" not in email:
-            st.error("メールアドレスの形式を確認してください。")
-            return
-        if find_user_by_login(db, email):
-            st.error("このメールアドレスは登録済みです。ログイン画面へ進んでください。")
-            return
-        if not (accept_terms and accept_privacy and accept_commercial):
-            st.error("登録前の確認事項に同意してください。")
-            return
-        user, password = create_user(
-            db,
-            {
-                "name": name,
-                "company": company,
-                "email": email,
-                "role": role,
-                "team_size": team_size,
-                "source": source,
-                "use_case": use_case,
-            },
-        )
-        st.session_state["issued_credentials"] = {"login_id": user["login_id"], "password": password}
-        st.rerun()
+        if st.button("ID/PASSを持っている方はこちら"):
+            st.session_state[NAV_REQUEST_KEY] = "ログイン"
+            st.rerun()
 
 
 def render_login(db: dict[str, Any]) -> None:
@@ -1369,7 +1334,7 @@ def render_login(db: dict[str, Any]) -> None:
             st.session_state[NAV_REQUEST_KEY] = "マイページ"
             st.rerun()
         st.error("IDまたはパスワードが違います。")
-    if col2.button("新規登録へ"):
+    if col2.button("登録案内へ"):
         st.session_state[NAV_REQUEST_KEY] = "サービス登録"
         st.rerun()
 
@@ -1384,6 +1349,108 @@ def render_login(db: dict[str, Any]) -> None:
                     st.session_state[NAV_REQUEST_KEY] = "ダッシュボード"
                     st.rerun()
                 st.error("パスコードが違います。")
+
+
+def render_credential_issue(db: dict[str, Any]) -> None:
+    if not st.session_state.get("admin_authenticated"):
+        st.title("ID/PASS発行")
+        st.error("この画面は運営者専用です。ログイン画面の運営用ログインから入ってください。")
+        return
+
+    st.title("ID/PASS発行")
+    st.caption("noteメンバーシップ契約を確認したユーザーだけ発行してください。")
+
+    issued = st.session_state.get("admin_issued_credentials")
+    if issued:
+        st.success("ID/PASSを発行しました。この内容をユーザーへ通知してください。")
+        col1, col2 = st.columns(2)
+        col1.code(issued["login_id"], language=None)
+        col2.code(issued["password"], language=None)
+        st.text_area(
+            "通知文テンプレート",
+            value=f"""SalesPilot AIのご契約ありがとうございます。
+ログイン情報を発行しました。
+
+ログインURL: {get_secret("APP_PUBLIC_URL", "https://salespilot.streamlit.app/")}
+ログインID: {issued["login_id"]}
+初期パスワード: {issued["password"]}
+
+ログイン後、マイページから利用を開始してください。
+初期パスワードは第三者に共有しないようお願いいたします。
+""",
+            height=220,
+        )
+        if st.button("次のID/PASSを発行する"):
+            st.session_state.pop("admin_issued_credentials", None)
+            st.rerun()
+        st.divider()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        name = st.text_input("契約者名", placeholder="山田 太郎", key="issue-name")
+        company = st.text_input("会社名/屋号", placeholder="株式会社〇〇", key="issue-company")
+        email = st.text_input("メールアドレス", placeholder="name@example.com", key="issue-email")
+        note_name = st.text_input("note加入者名", placeholder="note上の表示名", key="issue-note-name")
+    with col2:
+        role = st.text_input("役職/担当", placeholder="代表、営業担当、営業責任者など", key="issue-role")
+        team_size = st.selectbox("営業チーム規模", ["1人", "2～5人", "6～10人", "11人以上"], key="issue-team-size")
+        use_case = st.text_area("利用目的メモ", placeholder="商談メモ整理、提案資料骨子作成など", height=120, key="issue-use-case")
+        confirmed = st.checkbox("noteメンバーシップ契約を確認済み", key="issue-confirmed")
+
+    if st.button("ID/PASSを発行", type="primary"):
+        if not name or not company or not email:
+            st.error("契約者名、会社名/屋号、メールアドレスを入力してください。")
+            return
+        if "@" not in email:
+            st.error("メールアドレスの形式を確認してください。")
+            return
+        if find_user_by_login(db, email):
+            st.error("このメールアドレスは登録済みです。")
+            return
+        if not confirmed:
+            st.error("noteメンバーシップ契約確認にチェックしてください。")
+            return
+        user, password = create_user(
+            db,
+            {
+                "name": name,
+                "company": company,
+                "email": email,
+                "role": role,
+                "team_size": team_size,
+                "source": "note",
+                "use_case": use_case,
+                "note_member_name": note_name,
+            },
+        )
+        user["billing_provider"] = "note"
+        user["note_member_name"] = note_name
+        user["manual_issued_at"] = now_iso()
+        user["next_billing_label"] = "noteメンバーシップ側で管理"
+        save_db(db)
+        st.session_state["admin_issued_credentials"] = {"login_id": user["login_id"], "password": password}
+        st.rerun()
+
+    users = db.get("users", [])
+    if users:
+        st.subheader("発行済みユーザー")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "ログインID": user.get("login_id"),
+                        "氏名": user.get("name"),
+                        "会社": user.get("company"),
+                        "メール": user.get("email"),
+                        "状態": user.get("subscription_status"),
+                        "発行日": user.get("created_at"),
+                    }
+                    for user in users
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+        )
 
 
 def render_mypage(db: dict[str, Any]) -> None:
@@ -1414,21 +1481,21 @@ def render_mypage(db: dict[str, Any]) -> None:
 
     st.subheader("契約管理")
     if user.get("cancel_requested_at"):
-        st.warning(f"解約申請を受け付けています: {user['cancel_requested_at']}")
-        if st.button("解約申請を取り消す"):
+        st.warning(f"利用停止申請を受け付けています: {user['cancel_requested_at']}")
+        if st.button("利用停止申請を取り消す"):
             user["cancel_requested_at"] = ""
             user["subscription_status"] = "active"
             user["updated_at"] = now_iso()
-            db.setdefault("subscription_events", []).insert(0, {"id": str(uuid.uuid4()), "user_id": user["id"], "event": "cancel_request_revoked", "detail": "解約申請取り消し", "created_at": now_iso()})
+            db.setdefault("subscription_events", []).insert(0, {"id": str(uuid.uuid4()), "user_id": user["id"], "event": "cancel_request_revoked", "detail": "利用停止申請取り消し", "created_at": now_iso()})
             save_db(db)
             st.rerun()
     else:
-        st.info("プラン変更、請求先変更、領収書発行は正式決済連携後にこの画面へ追加します。")
-        if st.button("解約を申請する", type="secondary"):
+        st.info("サブスクリプション契約、解約、領収書はnoteメンバーシップ側で管理してください。この画面ではSalesPilot側の利用停止申請だけ受け付けます。")
+        if st.button("SalesPilotの利用停止を申請する", type="secondary"):
             user["cancel_requested_at"] = now_iso()
             user["subscription_status"] = "cancel_requested"
             user["updated_at"] = now_iso()
-            db.setdefault("subscription_events", []).insert(0, {"id": str(uuid.uuid4()), "user_id": user["id"], "event": "cancel_requested", "detail": "マイページから解約申請", "created_at": now_iso()})
+            db.setdefault("subscription_events", []).insert(0, {"id": str(uuid.uuid4()), "user_id": user["id"], "event": "cancel_requested", "detail": "マイページから利用停止申請", "created_at": now_iso()})
             save_db(db)
             st.rerun()
 
@@ -1443,6 +1510,12 @@ def render_mypage(db: dict[str, Any]) -> None:
 def require_account(db: dict[str, Any], page: str) -> bool:
     if page in PUBLIC_PAGES:
         return True
+    if page in ADMIN_PAGES:
+        if st.session_state.get("admin_authenticated"):
+            return True
+        st.error("このページは運営者専用です。")
+        render_login(db)
+        return False
     if st.session_state.get("admin_authenticated") or current_user(db):
         return True
     render_login(db)
@@ -2128,14 +2201,16 @@ OPENAI_MODEL_LIGHT = "gpt-5.4-mini"
 MONTHLY_DEAL_LIMIT = 30
 MONTHLY_AI_LIMIT = 300
 APP_PASSWORD = "任意の運営用パスコード"
+APP_PUBLIC_URL = "https://salespilot.streamlit.app/"
+NOTE_SUBSCRIPTION_URL = "https://note.com/あなたのnote/..."
 ```
 
 ### 4. Deploy
 公開URLは `https://任意の名前.streamlit.app` になります。
 
 ### 注意
-この初期版は登録、ログイン、マイページ、解約申請をJSONファイル保存で動かします。
-Streamlit Cloudの再起動や再デプロイで保存データが消える可能性があるため、実ユーザー運用に入る前にSupabaseなどのDBとStripeなどのサブスク決済へ差し替えてください。
+この初期版はnoteサブスクリプション契約を前提に、運営者がID/PASSを手動発行します。
+ユーザー情報はJSONファイル保存のため、Streamlit Cloudの再起動や再デプロイで保存データが消える可能性があります。実ユーザーが増える前にSupabaseなどのDBへ差し替えてください。
 """
     )
 
@@ -2163,7 +2238,7 @@ def main() -> None:
     db = load_db()
     st.sidebar.title(APP_NAME)
     st.sidebar.caption(f"{PLAN_INTERVAL}{PLAN_PRICE_YEN:,}円プラン")
-    pages = PUBLIC_PAGES + PROTECTED_PAGES
+    pages = PUBLIC_PAGES + PROTECTED_PAGES + (ADMIN_PAGES if st.session_state.get("admin_authenticated") else [])
     requested_page = st.session_state.pop(NAV_REQUEST_KEY, None)
     query_page = st.query_params.get(PAGE_QUERY_KEY)
     user = current_user(db)
@@ -2220,6 +2295,8 @@ def main() -> None:
         render_login(db)
     elif page == "マイページ":
         render_mypage(db)
+    elif page == "ID/PASS発行":
+        render_credential_issue(db)
     elif page == "ダッシュボード":
         render_dashboard(db)
     elif page == "新規案件登録":
