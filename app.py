@@ -2,8 +2,11 @@
 
 import html
 import hashlib
+import hmac
 import json
 import re
+import secrets as py_secrets
+import string
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -23,6 +26,11 @@ NAV_REQUEST_KEY = "requested_page"
 FOCUS_ACTION_KEY = "focus_action"
 DETAIL_VIEW_KEY = "detail_view"
 PAGE_QUERY_KEY = "page"
+PUBLIC_PAGES = ["サービス登録", "ログイン"]
+PROTECTED_PAGES = ["マイページ", "ダッシュボード", "新規案件登録", "案件詳細", "過去案件分析", "利用状況", "公開手順"]
+PLAN_NAME = "SalesPilot AI スタータープラン"
+PLAN_PRICE_YEN = 1500
+PLAN_INTERVAL = "月額"
 
 
 def get_secret(name: str, default: Any = None) -> Any:
@@ -197,7 +205,7 @@ def month_key() -> str:
 
 
 def empty_db() -> dict[str, Any]:
-    return {"deals": [], "ai_outputs": [], "usage": {}, "url_cache": {}, "ai_cache": {}}
+    return {"deals": [], "ai_outputs": [], "usage": {}, "url_cache": {}, "ai_cache": {}, "users": [], "subscription_events": []}
 
 
 def load_db() -> dict[str, Any]:
@@ -214,6 +222,8 @@ def load_db() -> dict[str, Any]:
     data.setdefault("usage", {})
     data.setdefault("url_cache", {})
     data.setdefault("ai_cache", {})
+    data.setdefault("users", [])
+    data.setdefault("subscription_events", [])
     return data
 
 
@@ -223,19 +233,82 @@ def save_db(db: dict[str, Any]) -> None:
         json.dump(db, f, ensure_ascii=False, indent=2)
 
 
+def current_user_id() -> str | None:
+    return st.session_state.get("user_id")
+
+
+def current_user(db: dict[str, Any]) -> dict[str, Any] | None:
+    user_id = current_user_id()
+    if not user_id:
+        return None
+    return next((user for user in db.get("users", []) if user.get("id") == user_id), None)
+
+
+def usage_key() -> str:
+    user_id = current_user_id()
+    return f"{month_key()}:{user_id}" if user_id else month_key()
+
+
+def generate_user_id(db: dict[str, Any]) -> str:
+    existing = {user.get("login_id") for user in db.get("users", [])}
+    alphabet = string.ascii_uppercase + string.digits
+    while True:
+        suffix = "".join(py_secrets.choice(alphabet) for _ in range(6))
+        login_id = f"SP-{date.today().strftime('%y%m')}-{suffix}"
+        if login_id not in existing:
+            return login_id
+
+
+def generate_initial_password() -> str:
+    alphabet = string.ascii_letters + string.digits
+    return "".join(py_secrets.choice(alphabet) for _ in range(12))
+
+
+def hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
+    salt = salt or py_secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120_000)
+    return salt, digest.hex()
+
+
+def verify_password(password: str, salt: str, password_hash: str) -> bool:
+    _, candidate = hash_password(password, salt)
+    return hmac.compare_digest(candidate, password_hash)
+
+
+def find_user_by_login(db: dict[str, Any], login: str) -> dict[str, Any] | None:
+    normalized = login.strip().lower()
+    return next(
+        (
+            user
+            for user in db.get("users", [])
+            if user.get("login_id", "").lower() == normalized or user.get("email", "").lower() == normalized
+        ),
+        None,
+    )
+
+
+def user_data_visible(deal: dict[str, Any]) -> bool:
+    user_id = current_user_id()
+    if st.session_state.get("admin_authenticated"):
+        return True
+    if not user_id:
+        return False
+    return deal.get("owner_user_id") == user_id
+
+
 def get_usage(db: dict[str, Any]) -> dict[str, int]:
-    usage = db.setdefault("usage", {}).setdefault(month_key(), {"deals": 0, "ai_credits": 0})
+    usage = db.setdefault("usage", {}).setdefault(usage_key(), {"deals": 0, "ai_credits": 0})
     usage.setdefault("deals", 0)
     usage.setdefault("ai_credits", 0)
     return usage
 
 
 def active_deals(db: dict[str, Any]) -> list[dict[str, Any]]:
-    return [deal for deal in db["deals"] if deal.get("status") == "active"]
+    return [deal for deal in db["deals"] if deal.get("status") == "active" and user_data_visible(deal)]
 
 
 def past_deals(db: dict[str, Any]) -> list[dict[str, Any]]:
-    return [deal for deal in db["deals"] if deal.get("status") in {"won", "lost"}]
+    return [deal for deal in db["deals"] if deal.get("status") in {"won", "lost"} and user_data_visible(deal)]
 
 
 def status_for_phase(phase: str, current_status: str = "active") -> str:
@@ -301,6 +374,7 @@ def normalize_url(url: str) -> str:
 def create_deal(db: dict[str, Any], deal: dict[str, Any]) -> dict[str, Any]:
     created = {
         "id": str(uuid.uuid4()),
+        "owner_user_id": current_user_id(),
         "title": f"{deal['customer_name']} × {deal['product_name']}",
         "status": "active",
         "win_probability": None,
@@ -329,6 +403,7 @@ def add_ai_output(
         {
             "id": str(uuid.uuid4()),
             "deal_id": deal_id,
+            "owner_user_id": current_user_id(),
             "type": output_type,
             "input_text": prompt,
             "output_text": output_text,
@@ -345,6 +420,7 @@ def cache_key_for(output_type: str, prompt: str, quality: str, max_output_tokens
             "type": output_type,
             "quality": quality,
             "max_output_tokens": max_output_tokens,
+            "user_id": current_user_id() or "public",
             "prompt": trim_prompt(prompt),
         },
         ensure_ascii=False,
@@ -1146,6 +1222,233 @@ def require_passcode() -> bool:
     return False
 
 
+def create_user(db: dict[str, Any], profile: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    initial_password = generate_initial_password()
+    salt, password_hash = hash_password(initial_password)
+    user = {
+        "id": str(uuid.uuid4()),
+        "login_id": generate_user_id(db),
+        "email": profile["email"].strip().lower(),
+        "name": profile["name"].strip(),
+        "company": profile["company"].strip(),
+        "role": profile.get("role", "").strip(),
+        "team_size": profile.get("team_size", ""),
+        "source": profile.get("source", ""),
+        "use_case": profile.get("use_case", "").strip(),
+        "plan_name": PLAN_NAME,
+        "plan_price_yen": PLAN_PRICE_YEN,
+        "plan_interval": PLAN_INTERVAL,
+        "subscription_status": "active",
+        "subscription_started_at": now_iso(),
+        "next_billing_label": "登録日から1か月ごと",
+        "cancel_requested_at": "",
+        "password_salt": salt,
+        "password_hash": password_hash,
+        "terms_accepted_at": now_iso(),
+        "privacy_accepted_at": now_iso(),
+        "ai_policy_accepted_at": now_iso(),
+        "commercial_terms_accepted_at": now_iso(),
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    db.setdefault("users", []).insert(0, user)
+    db.setdefault("subscription_events", []).insert(
+        0,
+        {
+            "id": str(uuid.uuid4()),
+            "user_id": user["id"],
+            "event": "created",
+            "detail": f"{PLAN_NAME} / {PLAN_INTERVAL}{PLAN_PRICE_YEN:,}円",
+            "created_at": now_iso(),
+        },
+    )
+    save_db(db)
+    return user, initial_password
+
+
+def login_user(user: dict[str, Any]) -> None:
+    st.session_state["user_id"] = user["id"]
+    st.session_state["account_authenticated"] = True
+    st.session_state.pop("admin_authenticated", None)
+    st.session_state.pop("issued_credentials", None)
+
+
+def logout_user() -> None:
+    for key in ["user_id", "account_authenticated", "admin_authenticated", "authenticated"]:
+        st.session_state.pop(key, None)
+
+
+def render_policy_summary() -> None:
+    st.markdown(
+        f"""
+**登録前の確認事項**
+
+- プランは **{PLAN_NAME} / {PLAN_INTERVAL}{PLAN_PRICE_YEN:,}円（税込想定）** です。
+- 入力した案件情報・商談メモは、本人の営業支援機能を提供する目的で利用します。
+- AI生成結果は営業判断を補助するもので、最終確認と顧客への送信判断はユーザー側で行います。
+- クレジット上限は月{MONTHLY_AI_LIMIT}クレジット、案件登録上限は月{MONTHLY_DEAL_LIMIT}件です。
+- 機密情報、個人番号、決済情報、パスワードなどの入力は避けてください。
+- 解約はマイページから申請できます。実決済連携後は決済事業者の請求サイクルに従います。
+"""
+    )
+
+
+def render_signup(db: dict[str, Any]) -> None:
+    st.title("SalesPilot登録")
+    st.caption("SNSやnoteから来た方向けの月額プラン登録画面です。")
+    render_policy_summary()
+    st.divider()
+
+    issued = st.session_state.get("issued_credentials")
+    if issued:
+        st.success("登録が完了しました。以下のID/PASSはこの画面で一度だけ控えてください。")
+        col1, col2 = st.columns(2)
+        col1.code(issued["login_id"], language=None)
+        col2.code(issued["password"], language=None)
+        st.info("控えたら、ログイン画面からマイページへ進んでください。")
+        if st.button("ログイン画面へ進む", type="primary"):
+            st.session_state[NAV_REQUEST_KEY] = "ログイン"
+            st.rerun()
+        return
+
+    col1, col2 = st.columns(2)
+    with col1:
+        name = st.text_input("氏名", placeholder="山田 太郎")
+        company = st.text_input("会社名/屋号", placeholder="株式会社〇〇")
+        email = st.text_input("メールアドレス", placeholder="name@example.com")
+        role = st.text_input("役職/担当", placeholder="代表、営業担当、営業責任者など")
+    with col2:
+        team_size = st.selectbox("営業チーム規模", ["1人", "2～5人", "6～10人", "11人以上"])
+        source = st.selectbox("流入元", ["note", "X", "Threads", "紹介", "その他"])
+        use_case = st.text_area("使いたい目的", placeholder="商談メモ整理、提案資料骨子作成、次アクション管理など", height=120)
+
+    accept_terms = st.checkbox("利用規約、料金、解約条件を確認しました")
+    accept_privacy = st.checkbox("プライバシーポリシーとAI利用時のデータ取扱いを確認しました")
+    accept_commercial = st.checkbox(f"{PLAN_NAME}が{PLAN_INTERVAL}{PLAN_PRICE_YEN:,}円の有料サービスであることを確認しました")
+    submitted = st.button("登録してID/PASSを発行", type="primary")
+
+    if submitted:
+        if not name or not company or not email:
+            st.error("氏名、会社名/屋号、メールアドレスを入力してください。")
+            return
+        if "@" not in email:
+            st.error("メールアドレスの形式を確認してください。")
+            return
+        if find_user_by_login(db, email):
+            st.error("このメールアドレスは登録済みです。ログイン画面へ進んでください。")
+            return
+        if not (accept_terms and accept_privacy and accept_commercial):
+            st.error("登録前の確認事項に同意してください。")
+            return
+        user, password = create_user(
+            db,
+            {
+                "name": name,
+                "company": company,
+                "email": email,
+                "role": role,
+                "team_size": team_size,
+                "source": source,
+                "use_case": use_case,
+            },
+        )
+        st.session_state["issued_credentials"] = {"login_id": user["login_id"], "password": password}
+        st.rerun()
+
+
+def render_login(db: dict[str, Any]) -> None:
+    st.title("ログイン")
+    st.caption("登録時に発行されたID/PASSでログインしてください。")
+    login = st.text_input("ログインIDまたはメールアドレス")
+    password = st.text_input("パスワード", type="password")
+    col1, col2 = st.columns(2)
+    if col1.button("ログイン", type="primary"):
+        user = find_user_by_login(db, login)
+        if user and verify_password(password, user.get("password_salt", ""), user.get("password_hash", "")):
+            login_user(user)
+            st.session_state[NAV_REQUEST_KEY] = "マイページ"
+            st.rerun()
+        st.error("IDまたはパスワードが違います。")
+    if col2.button("新規登録へ"):
+        st.session_state[NAV_REQUEST_KEY] = "サービス登録"
+        st.rerun()
+
+    admin_password = get_secret("APP_PASSWORD")
+    if admin_password:
+        with st.expander("運営用ログイン"):
+            entered = st.text_input("運営パスコード", type="password", key="admin-passcode")
+            if st.button("運営ログイン"):
+                if entered == admin_password:
+                    st.session_state["admin_authenticated"] = True
+                    st.session_state["account_authenticated"] = True
+                    st.session_state[NAV_REQUEST_KEY] = "ダッシュボード"
+                    st.rerun()
+                st.error("パスコードが違います。")
+
+
+def render_mypage(db: dict[str, Any]) -> None:
+    user = current_user(db)
+    if not user:
+        render_login(db)
+        return
+    st.title("マイページ")
+    st.caption(f"{user['company']} / {user['name']} 様")
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("契約プラン", user.get("plan_name", PLAN_NAME))
+    col2.metric("月額", f"{user.get('plan_price_yen', PLAN_PRICE_YEN):,}円")
+    col3.metric("契約状態", "解約申請中" if user.get("cancel_requested_at") else "利用中")
+
+    st.subheader("契約情報")
+    st.table(
+        pd.DataFrame(
+            [
+                {"項目": "ログインID", "内容": user.get("login_id")},
+                {"項目": "メールアドレス", "内容": user.get("email")},
+                {"項目": "開始日", "内容": user.get("subscription_started_at")},
+                {"項目": "次回請求", "内容": user.get("next_billing_label")},
+                {"項目": "月間上限", "内容": f"案件{MONTHLY_DEAL_LIMIT}件 / AI{MONTHLY_AI_LIMIT}クレジット"},
+            ]
+        )
+    )
+
+    st.subheader("契約管理")
+    if user.get("cancel_requested_at"):
+        st.warning(f"解約申請を受け付けています: {user['cancel_requested_at']}")
+        if st.button("解約申請を取り消す"):
+            user["cancel_requested_at"] = ""
+            user["subscription_status"] = "active"
+            user["updated_at"] = now_iso()
+            db.setdefault("subscription_events", []).insert(0, {"id": str(uuid.uuid4()), "user_id": user["id"], "event": "cancel_request_revoked", "detail": "解約申請取り消し", "created_at": now_iso()})
+            save_db(db)
+            st.rerun()
+    else:
+        st.info("プラン変更、請求先変更、領収書発行は正式決済連携後にこの画面へ追加します。")
+        if st.button("解約を申請する", type="secondary"):
+            user["cancel_requested_at"] = now_iso()
+            user["subscription_status"] = "cancel_requested"
+            user["updated_at"] = now_iso()
+            db.setdefault("subscription_events", []).insert(0, {"id": str(uuid.uuid4()), "user_id": user["id"], "event": "cancel_requested", "detail": "マイページから解約申請", "created_at": now_iso()})
+            save_db(db)
+            st.rerun()
+
+    st.subheader("利用開始")
+    col_start1, col_start2 = st.columns(2)
+    if col_start1.button("ダッシュボードへ", type="primary"):
+        navigate_to("ダッシュボード")
+    if col_start2.button("新規案件を登録"):
+        navigate_to("新規案件登録")
+
+
+def require_account(db: dict[str, Any], page: str) -> bool:
+    if page in PUBLIC_PAGES:
+        return True
+    if st.session_state.get("admin_authenticated") or current_user(db):
+        return True
+    render_login(db)
+    return False
+
+
 def render_usage_banner(db: dict[str, Any]) -> None:
     usage = get_usage(db)
     deal_rate = min(usage["deals"] / MONTHLY_DEAL_LIMIT, 1.0)
@@ -1420,7 +1723,7 @@ def render_new_deal(db: dict[str, Any]) -> None:
 
 
 def select_deal(db: dict[str, Any], include_past: bool = False) -> dict[str, Any] | None:
-    deals = db["deals"] if include_past else active_deals(db)
+    deals = [deal for deal in db["deals"] if user_data_visible(deal)] if include_past else active_deals(db)
     if not deals:
         st.info("表示できる案件がありません。")
         return None
@@ -1824,15 +2127,15 @@ OPENAI_MODEL_HIGH = "gpt-5.4"
 OPENAI_MODEL_LIGHT = "gpt-5.4-mini"
 MONTHLY_DEAL_LIMIT = 30
 MONTHLY_AI_LIMIT = 300
-APP_PASSWORD = "任意の招待制パスコード"
+APP_PASSWORD = "任意の運営用パスコード"
 ```
 
 ### 4. Deploy
 公開URLは `https://任意の名前.streamlit.app` になります。
 
 ### 注意
-この初期版はJSONファイル保存です。Streamlit Cloudの再起動や再デプロイで保存データが消える可能性があります。
-実ユーザー運用に入る前に、Google SheetsまたはSupabase保存へ差し替えるのがおすすめです。
+この初期版は登録、ログイン、マイページ、解約申請をJSONファイル保存で動かします。
+Streamlit Cloudの再起動や再デプロイで保存データが消える可能性があるため、実ユーザー運用に入る前にSupabaseなどのDBとStripeなどのサブスク決済へ差し替えてください。
 """
     )
 
@@ -1857,19 +2160,19 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    if not require_passcode():
-        return
-
     db = load_db()
     st.sidebar.title(APP_NAME)
-    st.sidebar.caption("Streamlit MVP")
-    pages = ["ダッシュボード", "新規案件登録", "案件詳細", "過去案件分析", "利用状況", "公開手順"]
+    st.sidebar.caption(f"{PLAN_INTERVAL}{PLAN_PRICE_YEN:,}円プラン")
+    pages = PUBLIC_PAGES + PROTECTED_PAGES
     requested_page = st.session_state.pop(NAV_REQUEST_KEY, None)
     query_page = st.query_params.get(PAGE_QUERY_KEY)
+    user = current_user(db)
     if requested_page in pages:
         default_page = requested_page
     elif query_page in pages:
         default_page = query_page
+    elif not user and not st.session_state.get("admin_authenticated"):
+        default_page = "サービス登録"
     else:
         default_page = "ダッシュボード"
     page = st.sidebar.radio(
@@ -1881,18 +2184,43 @@ def main() -> None:
     if st.query_params.get(PAGE_QUERY_KEY) != page:
         st.query_params[PAGE_QUERY_KEY] = page
     st.sidebar.divider()
-    st.sidebar.selectbox(
-        "AI品質モード",
-        QUALITY_MODES,
-        index=QUALITY_MODES.index(DEFAULT_QUALITY_MODE) if DEFAULT_QUALITY_MODE in QUALITY_MODES else 1,
-        key="quality_mode",
-        help="エコノミーは原価優先、標準は重要生成だけ高品質、高品質は品質優先です。",
-    )
-    st.sidebar.divider()
-    st.sidebar.caption("セキュリティ/注意事項")
-    st.sidebar.write("入力情報は、このユーザーへのAIレスポンス生成にのみ利用する前提です。")
+    if user:
+        st.sidebar.success(f"{user['name']}さんでログイン中")
+        if st.sidebar.button("ログアウト"):
+            logout_user()
+            st.session_state[NAV_REQUEST_KEY] = "ログイン"
+            st.rerun()
+        st.sidebar.divider()
+    elif st.session_state.get("admin_authenticated"):
+        st.sidebar.success("運営モード")
+        if st.sidebar.button("ログアウト"):
+            logout_user()
+            st.session_state[NAV_REQUEST_KEY] = "ログイン"
+            st.rerun()
+        st.sidebar.divider()
 
-    if page == "ダッシュボード":
+    if page not in PUBLIC_PAGES:
+        st.sidebar.selectbox(
+            "AI品質モード",
+            QUALITY_MODES,
+            index=QUALITY_MODES.index(DEFAULT_QUALITY_MODE) if DEFAULT_QUALITY_MODE in QUALITY_MODES else 1,
+            key="quality_mode",
+            help="エコノミーは原価優先、標準は重要生成だけ高品質、高品質は品質優先です。",
+        )
+        st.sidebar.divider()
+        st.sidebar.caption("セキュリティ/注意事項")
+        st.sidebar.write("入力情報は、ログイン中ユーザーへのAIレスポンス生成にのみ利用します。")
+
+    if not require_account(db, page):
+        return
+
+    if page == "サービス登録":
+        render_signup(db)
+    elif page == "ログイン":
+        render_login(db)
+    elif page == "マイページ":
+        render_mypage(db)
+    elif page == "ダッシュボード":
         render_dashboard(db)
     elif page == "新規案件登録":
         render_new_deal(db)
