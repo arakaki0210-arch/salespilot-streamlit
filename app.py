@@ -776,7 +776,6 @@ def render_new_deal(db: dict[str, Any]) -> None:
                 "memo": memo,
             },
         )
-        st.session_state["new_product_description"] = ""
         st.session_state["selected_deal_id"] = deal["id"]
         st.session_state["page"] = "案件詳細"
         st.success("案件を登録しました。")
