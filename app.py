@@ -19,6 +19,7 @@ DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "app_db.json"
 NAV_KEY = "active_page"
 NAV_REQUEST_KEY = "requested_page"
+FOCUS_ACTION_KEY = "focus_action"
 
 
 def get_secret(name: str, default: Any = None) -> Any:
@@ -33,6 +34,7 @@ MONTHLY_AI_LIMIT = int(get_secret("MONTHLY_AI_LIMIT", 300))
 HIGH_MODEL = get_secret("OPENAI_MODEL_HIGH", "gpt-5.4")
 LIGHT_MODEL = get_secret("OPENAI_MODEL_LIGHT", "gpt-5.4-mini")
 MAX_PROMPT_CHARS = int(get_secret("MAX_PROMPT_CHARS", 24_000))
+LONG_PROMPT_SUMMARY_CHARS = int(get_secret("LONG_PROMPT_SUMMARY_CHARS", 18_000))
 
 PHASES = [
     "コンタクト前",
@@ -133,6 +135,7 @@ AI_CREDIT_COSTS = {
     "email": 1,
     "proposal_outline": 3,
     "win_loss_analysis": 2,
+    "output_refinement": 1,
 }
 
 AI_LABELS = {
@@ -143,6 +146,7 @@ AI_LABELS = {
     "email": "メール生成",
     "proposal_outline": "提案資料骨子",
     "win_loss_analysis": "受注・失注分析",
+    "output_refinement": "出力の整形・部分修正",
 }
 
 OUTPUT_TOKEN_LIMITS = {
@@ -153,6 +157,15 @@ OUTPUT_TOKEN_LIMITS = {
     "email": 1200,
     "proposal_outline": 3800,
     "win_loss_analysis": 1800,
+    "output_refinement": 1600,
+}
+
+ACTION_TO_TAB = {
+    "商談前リサーチ": "商談前リサーチ",
+    "ヒアリング設計": "ヒアリング設計",
+    "商談メモ分析": "商談メモ分析",
+    "メール生成": "メール生成",
+    "提案資料骨子": "提案資料骨子",
 }
 
 SYSTEM_INSTRUCTIONS = """
@@ -177,7 +190,7 @@ def month_key() -> str:
 
 
 def empty_db() -> dict[str, Any]:
-    return {"deals": [], "ai_outputs": [], "usage": {}}
+    return {"deals": [], "ai_outputs": [], "usage": {}, "url_cache": {}}
 
 
 def load_db() -> dict[str, Any]:
@@ -192,6 +205,7 @@ def load_db() -> dict[str, Any]:
     data.setdefault("deals", [])
     data.setdefault("ai_outputs", [])
     data.setdefault("usage", {})
+    data.setdefault("url_cache", {})
     return data
 
 
@@ -260,6 +274,10 @@ def register_ai_usage(db: dict[str, Any], credits: int) -> None:
 def register_deal_usage(db: dict[str, Any]) -> None:
     usage = get_usage(db)
     usage["deals"] += 1
+
+
+def normalize_url(url: str) -> str:
+    return url.strip().rstrip("/")
 
 
 def create_deal(db: dict[str, Any], deal: dict[str, Any]) -> dict[str, Any]:
@@ -336,6 +354,32 @@ def run_openai(prompt: str, quality: str = "high", max_output_tokens: int | None
     return text, model
 
 
+def needs_long_prompt_summary(prompt: str, output_type: str) -> bool:
+    return len(prompt) > LONG_PROMPT_SUMMARY_CHARS and output_type in {"meeting_analysis", "proposal_outline", "win_loss_analysis"}
+
+
+def summarize_long_prompt_if_needed(prompt: str, output_type: str) -> tuple[str, str | None]:
+    if not needs_long_prompt_summary(prompt, output_type):
+        return prompt, None
+    summary_prompt = f"""
+以下はAI生成に渡す入力ですが、長すぎます。
+重要な事実、顧客ニーズ、日付、決裁条件、次回アクション、懸念、提案材料を落とさず、後続の営業支援AIが使いやすい要約にしてください。
+
+入力:
+{trim_prompt(prompt)}
+""".strip()
+    summary, model = run_openai(
+        summary_prompt,
+        quality="light",
+        max_output_tokens=1400,
+    )
+    return (
+        "以下は長文入力を事前要約したものです。この要約を根拠に出力してください。\n\n"
+        f"{summary}",
+        model,
+    )
+
+
 def run_ai_and_store(
     db: dict[str, Any],
     deal: dict[str, Any],
@@ -344,20 +388,98 @@ def run_ai_and_store(
     quality: str = "high",
 ) -> str:
     credits = AI_CREDIT_COSTS[output_type]
+    if needs_long_prompt_summary(prompt, output_type):
+        credits += AI_CREDIT_COSTS["output_refinement"]
     if not can_use_ai(db, credits):
         raise RuntimeError(
             f"今月のAI利用上限を超えます。現在 {get_usage(db)['ai_credits']} / {MONTHLY_AI_LIMIT} クレジット利用済みです。"
         )
 
-    output_text, model = run_openai(prompt, quality=quality, max_output_tokens=OUTPUT_TOKEN_LIMITS.get(output_type))
+    prompt_for_generation, summary_model = summarize_long_prompt_if_needed(prompt, output_type)
+    output_text, model = run_openai(
+        prompt_for_generation,
+        quality=quality,
+        max_output_tokens=OUTPUT_TOKEN_LIMITS.get(output_type),
+    )
+    stored_prompt = prompt
+    if summary_model:
+        stored_prompt = f"[長文入力を{summary_model}で要約後に生成]\n\n{prompt}"
     register_ai_usage(db, credits)
-    add_ai_output(db, deal["id"], output_type, prompt, output_text, model, credits)
+    add_ai_output(db, deal["id"], output_type, stored_prompt, output_text, model, credits)
     save_db(db)
     return output_text
 
 
+def refine_output(db: dict[str, Any], deal: dict[str, Any], output: dict[str, Any], mode: str, instruction: str) -> str:
+    credits = AI_CREDIT_COSTS["output_refinement"]
+    if not can_use_ai(db, credits):
+        raise RuntimeError(
+            f"今月のAI利用上限を超えます。現在 {get_usage(db)['ai_credits']} / {MONTHLY_AI_LIMIT} クレジット利用済みです。"
+        )
+    prompt = f"""
+以下のAI出力を、指定された目的に合わせて整えてください。
+全文を作り直さず、必要な範囲だけを直してください。元の重要情報は保持してください。
+
+目的: {mode}
+追加指示: {instruction or "なし"}
+
+案件情報:
+{deal_context(deal, db)}
+
+元の出力:
+{output.get("output_text")}
+""".strip()
+    refined_text, model = run_openai(
+        prompt,
+        quality="light",
+        max_output_tokens=OUTPUT_TOKEN_LIMITS["output_refinement"],
+    )
+    register_ai_usage(db, credits)
+    add_ai_output(db, deal["id"], output["type"], prompt, refined_text, model, credits)
+    save_db(db)
+    return refined_text
+
+
 def format_date(value: str | None) -> str:
     return value if value else "未設定"
+
+
+def parse_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value[:10])
+    except ValueError:
+        return None
+
+
+def due_bucket(deal: dict[str, Any]) -> str:
+    due = parse_date(deal.get("next_meeting_date")) or parse_date(deal.get("target_close_date"))
+    if not due:
+        return "準備待ち"
+    today = date.today()
+    if due < today:
+        return "期限切れ"
+    if due == today:
+        return "今日やること"
+    return "今後の予定"
+
+
+def render_onboarding_guide(has_deals: bool) -> None:
+    st.subheader("まずやること")
+    steps = [
+        ("1", "案件を登録", "顧客名・商材・概要を入れて案件を作ります。"),
+        ("2", "商談前リサーチ", "顧客に刺さる機能・運用・訴求を整理します。"),
+        ("3", "商談メモ分析", "商談後に次回アクションと提案材料を抽出します。"),
+    ]
+    cols = st.columns(3)
+    for col, (num, title, body) in zip(cols, steps):
+        with col:
+            st.container(border=True).markdown(f"### {num}. {title}\n{body}")
+    if not has_deals:
+        if st.button("最初の案件を登録する", type="primary", key="start-first-deal"):
+            st.session_state[NAV_REQUEST_KEY] = "新規案件登録"
+            st.rerun()
 
 
 def deal_context(deal: dict[str, Any], db: dict[str, Any] | None = None) -> str:
@@ -667,7 +789,43 @@ def render_usage_banner(db: dict[str, Any]) -> None:
         st.progress(ai_rate)
 
 
-def render_output(output: dict[str, Any] | None) -> None:
+def render_output_tools(output: dict[str, Any], db: dict[str, Any] | None, deal: dict[str, Any] | None, key_prefix: str) -> None:
+    st.text_area(
+        "コピー用テキスト",
+        value=output["output_text"],
+        height=180,
+        key=f"copy-text-{key_prefix}-{output['id']}",
+    )
+    if db is None or deal is None:
+        return
+    mode = st.selectbox(
+        "整形方法",
+        ["短く要約", "提案資料向けに整える", "指定部分だけ修正"],
+        key=f"refine-mode-{key_prefix}-{output['id']}",
+    )
+    instruction = st.text_area(
+        "追加指示",
+        placeholder="例: 3つの箇条書きにする / 料金部分だけ柔らかくする",
+        height=90,
+        key=f"refine-instruction-{key_prefix}-{output['id']}",
+    )
+    if st.button("この出力を整える", key=f"refine-output-{key_prefix}-{output['id']}"):
+        try:
+            with st.spinner("出力を整えています..."):
+                refine_output(db, deal, output, mode, instruction)
+            st.success("整えた出力を保存しました。")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+
+def render_output(
+    output: dict[str, Any] | None,
+    db: dict[str, Any] | None = None,
+    deal: dict[str, Any] | None = None,
+    tools_in_expander: bool = True,
+    key_prefix: str = "output",
+) -> None:
     if not output:
         st.info("まだ生成結果がありません。")
         return
@@ -678,8 +836,15 @@ def render_output(output: dict[str, Any] | None) -> None:
         output["output_text"],
         file_name=f"{output['type']}_{output['created_at'].replace(':', '-')}.md",
         mime="text/markdown",
-        key=f"download-{output['id']}",
+        key=f"download-{key_prefix}-{output['id']}",
     )
+    if tools_in_expander:
+        with st.expander("コピー・再整形"):
+            render_output_tools(output, db, deal, key_prefix)
+    else:
+        st.markdown("**コピー・再整形**")
+        with st.container(border=True):
+            render_output_tools(output, db, deal, key_prefix)
 
 
 def render_dashboard(db: dict[str, Any]) -> None:
@@ -687,6 +852,7 @@ def render_dashboard(db: dict[str, Any]) -> None:
     render_usage_banner(db)
 
     deals = active_deals(db)
+    render_onboarding_guide(bool(deals))
     if not deals:
         st.info("進行中案件はまだありません。左メニューの「新規案件登録」から追加してください。")
         return
@@ -711,16 +877,26 @@ def render_dashboard(db: dict[str, Any]) -> None:
     st.subheader("案件別タイムスケジュール")
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
-    st.subheader("ネクストアクション")
-    for deal in deals:
-        with st.container(border=True):
-            st.markdown(f"**{deal['title']}**")
-            st.write(f"フェーズ: {deal['phase']} / 次回予定: {format_date(deal.get('next_meeting_date'))}")
-            st.write("次にやること: " + " → ".join(recommended_next_actions(db, deal)))
-            if st.button("この案件を開く", key=f"open-{deal['id']}"):
-                st.session_state["selected_deal_id"] = deal["id"]
-                st.session_state[NAV_REQUEST_KEY] = "案件詳細"
-                st.rerun()
+    st.subheader("優先度別ネクストアクション")
+    for bucket in ["期限切れ", "今日やること", "準備待ち", "今後の予定"]:
+        bucket_deals = [deal for deal in deals if due_bucket(deal) == bucket]
+        if not bucket_deals:
+            continue
+        st.markdown(f"#### {bucket}")
+        for deal in bucket_deals:
+            next_actions = recommended_next_actions(db, deal)
+            with st.container(border=True):
+                left, right = st.columns([3, 1])
+                with left:
+                    st.markdown(f"**{deal['title']}**")
+                    st.write(f"フェーズ: {deal['phase']} / 次回予定: {format_date(deal.get('next_meeting_date'))}")
+                    st.write("次にやること: " + " → ".join(next_actions))
+                with right:
+                    if st.button("開く", key=f"open-{deal['id']}"):
+                        st.session_state["selected_deal_id"] = deal["id"]
+                        st.session_state[FOCUS_ACTION_KEY] = next_actions[0] if next_actions else ""
+                        st.session_state[NAV_REQUEST_KEY] = "案件詳細"
+                        st.rerun()
 
 
 def render_new_deal(db: dict[str, Any]) -> None:
@@ -751,6 +927,12 @@ def render_new_deal(db: dict[str, Any]) -> None:
         product_url = st.text_input("商材URL", placeholder="https://example.com/product")
         if st.button("商材URLから概要を自動作成", disabled=not product_url):
             try:
+                cache_key = normalize_url(product_url)
+                cached = db.setdefault("url_cache", {}).get(cache_key)
+                if cached:
+                    st.session_state["new_product_description"] = cached["summary"]
+                    st.success("保存済みの商材概要を再利用しました。AIクレジットは消費していません。")
+                    st.rerun()
                 if not can_use_ai(db, AI_CREDIT_COSTS["product_summary"]):
                     st.error(
                         f"今月のAI利用上限を超えます。現在 {get_usage(db)['ai_credits']} / {MONTHLY_AI_LIMIT} クレジット利用済みです。"
@@ -764,6 +946,11 @@ def render_new_deal(db: dict[str, Any]) -> None:
                     max_output_tokens=OUTPUT_TOKEN_LIMITS["product_summary"],
                 )
                 register_ai_usage(db, AI_CREDIT_COSTS["product_summary"])
+                db.setdefault("url_cache", {})[cache_key] = {
+                    "summary": summary.strip(),
+                    "product_name": product_name,
+                    "updated_at": now_iso(),
+                }
                 save_db(db)
                 st.session_state["new_product_description"] = summary.strip()
                 st.success("商材概要を作成しました。")
@@ -933,7 +1120,7 @@ def render_research_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
             except Exception as exc:
                 st.error(str(exc))
     with right:
-        render_output(latest_output(db, deal["id"], "research"))
+        render_output(latest_output(db, deal["id"], "research"), db, deal, key_prefix="latest-research")
 
 
 def render_hearing_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
@@ -961,7 +1148,7 @@ def render_hearing_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
             except Exception as exc:
                 st.error(str(exc))
     with right:
-        render_output(latest_output(db, deal["id"], "hearing"))
+        render_output(latest_output(db, deal["id"], "hearing"), db, deal, key_prefix="latest-hearing")
 
 
 def render_meeting_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
@@ -996,7 +1183,7 @@ def render_meeting_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
             except Exception as exc:
                 st.error(str(exc))
     with right:
-        render_output(latest_output(db, deal["id"], "meeting_analysis"))
+        render_output(latest_output(db, deal["id"], "meeting_analysis"), db, deal, key_prefix="latest-meeting")
 
 
 def render_email_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
@@ -1008,7 +1195,7 @@ def render_email_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
             st.rerun()
         except Exception as exc:
             st.error(str(exc))
-    render_output(latest_output(db, deal["id"], "email"))
+    render_output(latest_output(db, deal["id"], "email"), db, deal, key_prefix="latest-email")
 
 
 def render_proposal_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
@@ -1052,7 +1239,7 @@ def render_proposal_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
             except Exception as exc:
                 st.error(str(exc))
     with right:
-        render_output(latest_output(db, deal["id"], "proposal_outline"))
+        render_output(latest_output(db, deal["id"], "proposal_outline"), db, deal, key_prefix="latest-proposal")
         st.link_button("ChatGPTを開く", "https://chatgpt.com/")
 
 
@@ -1098,7 +1285,7 @@ def render_winloss_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
             st.rerun()
         except Exception as exc:
             st.error(str(exc))
-    render_output(latest_output(db, deal["id"], "win_loss_analysis"))
+    render_output(latest_output(db, deal["id"], "win_loss_analysis"), db, deal, key_prefix="latest-winloss")
 
 
 def render_detail(db: dict[str, Any]) -> None:
@@ -1107,6 +1294,12 @@ def render_detail(db: dict[str, Any]) -> None:
     if not deal:
         return
     st.caption(f"{deal['customer_name']} / {deal['product_name']} / フェーズ: {deal['phase']}")
+    next_actions = recommended_next_actions(db, deal)
+    if next_actions:
+        focus_action = st.session_state.pop(FOCUS_ACTION_KEY, next_actions[0])
+        st.info(
+            f"次におすすめ: {focus_action}。下の「{ACTION_TO_TAB.get(focus_action, focus_action)}」タブを開いて作業してください。"
+        )
     tabs = st.tabs(
         [
             "概要",
@@ -1139,7 +1332,7 @@ def render_detail(db: dict[str, Any]) -> None:
     with tabs[8]:
         for output in outputs_for_deal(db, deal["id"]):
             with st.expander(f"{AI_LABELS.get(output['type'], output['type'])} / {output['created_at']}"):
-                render_output(output)
+                render_output(output, db, deal, tools_in_expander=False, key_prefix="history")
 
 
 def render_past_deals(db: dict[str, Any]) -> None:
