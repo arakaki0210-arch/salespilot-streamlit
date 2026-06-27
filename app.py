@@ -238,6 +238,16 @@ def past_deals(db: dict[str, Any]) -> list[dict[str, Any]]:
     return [deal for deal in db["deals"] if deal.get("status") in {"won", "lost"}]
 
 
+def status_for_phase(phase: str, current_status: str = "active") -> str:
+    if phase == "受注":
+        return "won"
+    if phase == "失注":
+        return "lost"
+    if phase != "ペンディング":
+        return "active"
+    return current_status or "active"
+
+
 def find_deal(db: dict[str, Any], deal_id: str | None) -> dict[str, Any] | None:
     if not deal_id:
         return None
@@ -1467,6 +1477,7 @@ def render_overview_tab(db: dict[str, Any], deal: dict[str, Any]) -> None:
                         "product_url": product_url,
                         "product_description": product_description,
                         "phase": phase,
+                        "status": status_for_phase(phase, deal.get("status", "active")),
                         "temperature": temperature,
                         "budget": budget,
                         "next_meeting_date": next_meeting_date,
