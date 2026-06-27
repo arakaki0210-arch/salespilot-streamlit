@@ -21,6 +21,7 @@ NAV_KEY = "active_page"
 NAV_REQUEST_KEY = "requested_page"
 FOCUS_ACTION_KEY = "focus_action"
 DETAIL_VIEW_KEY = "detail_view"
+PAGE_QUERY_KEY = "page"
 
 
 def get_secret(name: str, default: Any = None) -> Any:
@@ -573,11 +574,20 @@ def render_schedule_auto_button(db: dict[str, Any], deal: dict[str, Any], key_pr
         st.rerun()
 
 
-def open_detail_view(view_name: str) -> None:
-    st.session_state[DETAIL_VIEW_KEY] = view_name
-    st.session_state[FOCUS_ACTION_KEY] = view_name
-    st.session_state[NAV_REQUEST_KEY] = "案件詳細"
+def navigate_to(page: str, detail_view: str | None = None, selected_deal_id: str | None = None, focus_action: str | None = None) -> None:
+    st.session_state[NAV_REQUEST_KEY] = page
+    st.query_params[PAGE_QUERY_KEY] = page
+    if detail_view:
+        st.session_state[DETAIL_VIEW_KEY] = detail_view
+    if selected_deal_id:
+        st.session_state["selected_deal_id"] = selected_deal_id
+    if focus_action:
+        st.session_state[FOCUS_ACTION_KEY] = focus_action
     st.rerun()
+
+
+def open_detail_view(view_name: str) -> None:
+    navigate_to("案件詳細", detail_view=view_name, focus_action=view_name)
 
 
 def render_onboarding_guide(has_deals: bool) -> None:
@@ -595,8 +605,7 @@ def render_onboarding_guide(has_deals: bool) -> None:
                 disabled = target != "新規案件登録" and not has_deals
                 if st.button(title, type="primary" if num == "1" else "secondary", disabled=disabled, key=f"onboarding-{target}"):
                     if target == "新規案件登録":
-                        st.session_state[NAV_REQUEST_KEY] = "新規案件登録"
-                        st.rerun()
+                        navigate_to("新規案件登録")
                     open_detail_view(target)
                 if disabled:
                     st.caption("先に案件を登録してください。")
@@ -1092,11 +1101,7 @@ def render_dashboard(db: dict[str, Any]) -> None:
                     render_schedule_auto_button(db, deal, key_prefix="dashboard", label="自動作成")
                 with right:
                     if st.button("開く", key=f"dashboard-open-timeline-{deal['id']}"):
-                        st.session_state["selected_deal_id"] = deal["id"]
-                        st.session_state[DETAIL_VIEW_KEY] = "タイムライン"
-                        st.session_state[FOCUS_ACTION_KEY] = "スケジュール自動作成"
-                        st.session_state[NAV_REQUEST_KEY] = "案件詳細"
-                        st.rerun()
+                        navigate_to("案件詳細", detail_view="タイムライン", selected_deal_id=deal["id"], focus_action="スケジュール自動作成")
 
     st.subheader("優先度別ネクストアクション")
     for bucket in ["期限切れ", "今日やること", "準備待ち", "今後の予定"]:
@@ -1114,11 +1119,13 @@ def render_dashboard(db: dict[str, Any]) -> None:
                     st.write("次にやること: " + " → ".join(next_actions))
                 with right:
                     if st.button("開く", key=f"open-{deal['id']}"):
-                        st.session_state["selected_deal_id"] = deal["id"]
-                        st.session_state[FOCUS_ACTION_KEY] = next_actions[0] if next_actions else ""
-                        st.session_state[DETAIL_VIEW_KEY] = ACTION_TO_TAB.get(next_actions[0], "概要") if next_actions else "概要"
-                        st.session_state[NAV_REQUEST_KEY] = "案件詳細"
-                        st.rerun()
+                        focus_action = next_actions[0] if next_actions else ""
+                        navigate_to(
+                            "案件詳細",
+                            detail_view=ACTION_TO_TAB.get(focus_action, "概要") if focus_action else "概要",
+                            selected_deal_id=deal["id"],
+                            focus_action=focus_action,
+                        )
 
 
 def render_new_deal(db: dict[str, Any]) -> None:
@@ -1132,21 +1139,40 @@ def render_new_deal(db: dict[str, Any]) -> None:
     if "new_product_description" not in st.session_state:
         st.session_state["new_product_description"] = ""
     if st.session_state.pop("reset_new_deal_form", False):
+        for key in [
+            "new_customer_name",
+            "new_customer_industry",
+            "new_customer_size",
+            "new_department_name",
+            "new_contact_name",
+            "new_contact_role",
+            "new_product_name",
+            "new_product_url",
+            "new_product_description",
+            "new_phase",
+            "new_temperature",
+            "new_budget",
+            "new_competitor_info",
+            "new_memo",
+            "new_next_meeting_date",
+            "new_target_close_date",
+        ]:
+            st.session_state.pop(key, None)
         st.session_state["new_product_description"] = ""
 
     col1, col2 = st.columns(2)
     with col1:
-        customer_name = st.text_input("顧客名")
-        customer_industry = st.text_input("顧客企業の業界")
-        customer_size = st.selectbox("顧客企業規模", CUSTOMER_SIZES, index=3)
-        department_name = st.selectbox("部署名", DEPARTMENTS, index=DEPARTMENTS.index("営業部"))
-        contact_name = st.text_input("担当者名")
-        contact_role = st.selectbox("担当者役職", CONTACT_ROLES, index=CONTACT_ROLES.index("担当者"))
+        customer_name = st.text_input("顧客名", key="new_customer_name")
+        customer_industry = st.text_input("顧客企業の業界", key="new_customer_industry")
+        customer_size = st.selectbox("顧客企業規模", CUSTOMER_SIZES, index=3, key="new_customer_size")
+        department_name = st.selectbox("部署名", DEPARTMENTS, index=DEPARTMENTS.index("営業部"), key="new_department_name")
+        contact_name = st.text_input("担当者名", key="new_contact_name")
+        contact_role = st.selectbox("担当者役職", CONTACT_ROLES, index=CONTACT_ROLES.index("担当者"), key="new_contact_role")
     with col2:
-        product_name = st.text_input("提案商材名")
+        product_name = st.text_input("提案商材名", key="new_product_name")
         title = f"{customer_name} × {product_name}" if customer_name and product_name else "顧客名 × 提案商材名"
         st.text_input("案件名（自動生成）", value=title, disabled=True)
-        product_url = st.text_input("商材URL", placeholder="https://example.com/product")
+        product_url = st.text_input("商材URL", placeholder="https://example.com/product", key="new_product_url")
         if st.button("商材URLから概要を自動作成", disabled=not product_url):
             try:
                 cache_key = normalize_url(product_url)
@@ -1179,18 +1205,18 @@ def render_new_deal(db: dict[str, Any]) -> None:
             except Exception as exc:
                 st.error(str(exc))
         st.text_area("提案商材の概要", key="new_product_description", height=100)
-        phase = st.selectbox("商談フェーズ", PHASES, index=0)
-        temperature = st.selectbox("現在の温度感", TEMPERATURES, index=1)
-        budget = st.selectbox("予算感", BUDGET_RANGES, index=0)
+        phase = st.selectbox("商談フェーズ", PHASES, index=0, key="new_phase")
+        temperature = st.selectbox("現在の温度感", TEMPERATURES, index=1, key="new_temperature")
+        budget = st.selectbox("予算感", BUDGET_RANGES, index=0, key="new_budget")
 
     col3, col4 = st.columns(2)
     with col3:
-        next_meeting_date = st.date_input("次回予定日", value=None)
+        next_meeting_date = st.date_input("次回予定日", value=None, key="new_next_meeting_date")
     with col4:
-        target_close_date = st.date_input("導入予定日（受注目標日）", value=None)
+        target_close_date = st.date_input("導入予定日（受注目標日）", value=None, key="new_target_close_date")
 
-    competitor_info = st.text_area("競合情報")
-    memo = st.text_area("メモ")
+    competitor_info = st.text_area("競合情報", key="new_competitor_info")
+    memo = st.text_area("メモ", key="new_memo")
 
     if st.button("案件を登録", type="primary"):
         if not customer_name or not customer_industry or not product_name or not st.session_state["new_product_description"]:
@@ -1220,9 +1246,8 @@ def render_new_deal(db: dict[str, Any]) -> None:
         )
         st.session_state["selected_deal_id"] = deal["id"]
         st.session_state["reset_new_deal_form"] = True
-        st.session_state[NAV_REQUEST_KEY] = "案件詳細"
         st.success("案件を登録しました。")
-        st.rerun()
+        navigate_to("案件詳細", detail_view="概要", selected_deal_id=deal["id"], focus_action="商談前リサーチ")
 
 
 def select_deal(db: dict[str, Any], include_past: bool = False) -> dict[str, Any] | None:
@@ -1658,12 +1683,21 @@ def main() -> None:
     st.sidebar.caption("Streamlit MVP")
     pages = ["ダッシュボード", "新規案件登録", "案件詳細", "過去案件分析", "利用状況", "公開手順"]
     requested_page = st.session_state.pop(NAV_REQUEST_KEY, None)
+    query_page = st.query_params.get(PAGE_QUERY_KEY)
     if requested_page in pages:
-        st.session_state.pop(NAV_KEY, None)
         default_page = requested_page
+    elif query_page in pages:
+        default_page = query_page
     else:
-        default_page = st.session_state.get(NAV_KEY, "ダッシュボード")
-    page = st.sidebar.radio("メニュー", pages, index=pages.index(default_page) if default_page in pages else 0, key=NAV_KEY)
+        default_page = "ダッシュボード"
+    page = st.sidebar.radio(
+        "メニュー",
+        pages,
+        index=pages.index(default_page) if default_page in pages else 0,
+        key=f"{NAV_KEY}_{pages.index(default_page) if default_page in pages else 0}",
+    )
+    if st.query_params.get(PAGE_QUERY_KEY) != page:
+        st.query_params[PAGE_QUERY_KEY] = page
     st.sidebar.divider()
     st.sidebar.caption("セキュリティ/注意事項")
     st.sidebar.write("入力情報は、このユーザーへのAIレスポンス生成にのみ利用する前提です。")
